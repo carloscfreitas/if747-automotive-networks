@@ -1,12 +1,12 @@
+/**
+/* Bit timing module.
+/**/
+
 // Defining segments.
 #define SYNC_SEG 0
 #define PROP_SEG 1
 #define PHASE_SEG1 2
 #define PHASE_SEG2 3
-
-/**
-/* Bit timing configuration parameters.
-/**/
 
 // Bit and segments lengths (time quanta).
 #define SYNC_SEG_LEN 1
@@ -35,10 +35,13 @@ bool writingPoint = false;
 const byte hardSyncIntPin = 2;
 const byte resyncIntPin = 3;
 volatile unsigned char currentSegment = PROP_SEG;
-volatile unsigned char tqCnt = 0;
+volatile unsigned char tqSegCnt = 0;
+volatile unsigned char phaseError = 0;
+volatile unsigned char phaseSeg1Len = PHASE_SEG1_LEN;
+volatile unsigned char phaseSeg2Len = PHASE_SEG2_LEN;
 
 void setup() {
-  Serial.begin(4800);
+  Serial.begin(2400);
   pinMode(hardSyncIntPin, INPUT_PULLUP);
   pinMode(resyncIntPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(hardSyncIntPin), hardSync, FALLING);
@@ -48,60 +51,75 @@ void setup() {
 void loop() {
   plotValues();
   bitTimingStateMachine();
+  delay(TQ);
+  tqSegCnt++;
 }
 
 void bitTimingStateMachine() {
   switch(currentSegment) {
     case SYNC_SEG:
-      if(tqCnt == SYNC_SEG_LEN) {
-        tqCnt = 0;
-        writingPoint = false;
+      if(tqSegCnt == SYNC_SEG_LEN) {
+        tqSegCnt = 0;
+        writingPoint = false; // Disable writing point.
         currentSegment = PROP_SEG;
       }
       break; 
     case PROP_SEG:
-      if(tqCnt == PROP_SEG_LEN) {
-        tqCnt = 0;
+      if(tqSegCnt == PROP_SEG_LEN) {
+        tqSegCnt = 0;
         currentSegment = PHASE_SEG1;
       }
       break;
     case PHASE_SEG1:
-      if(tqCnt == PHASE_SEG1_LEN) {
-        // TODO: Sample bit.
-        samplePoint = true;
-        tqCnt = 0;
+      if(tqSegCnt == phaseSeg1Len) {
+        samplePoint = true; // Enable sample point.
+        tqSegCnt = 0;
         currentSegment = PHASE_SEG2;
+        restoreSegsDefaultLen(); // Restore PHASE_SEG1 default lenght.
       }
       break;
     case PHASE_SEG2:
-      if(samplePoint) samplePoint = false;
-      if(tqCnt == PHASE_SEG2_LEN) {
-        writingPoint = true;
-        tqCnt = 0;
+      if(samplePoint) samplePoint = false; // Disable sample point.
+      if(tqSegCnt == phaseSeg2Len) {
+        writingPoint = true; // Enable writing point.
+        tqSegCnt = 0;
         currentSegment = SYNC_SEG;
+        restoreSegsDefaultLen(); // Restore PHASE_SEG2 default lenght.
       }
       break;
     default:
       Serial.println("Unknown segment!");
       break;
   }
-  delay(TQ);
-  tqCnt++;
+}
+
+void restoreSegsDefaultLen() {
+  phaseSeg1Len = PHASE_SEG1_LEN;
+  phaseSeg2Len = PHASE_SEG2_LEN;
 }
 
 void hardSync() {
   currentSegment = PROP_SEG;
-  tqCnt = 0;
+  tqSegCnt = 0;
 }
 
 void resync() {
   switch(currentSegment){
+    case SYNC_SEG:
+      break;
     case PROP_SEG:
+      // Lengthen PHASE_SEG1 to compensate phase error (max. SJW).
+      phaseError = min(tqSegCnt + SYNC_SEG_LEN, PROP_SEG_LEN);
+      phaseSeg1Len = PHASE_SEG1_LEN + ((phaseError <= SJW) ? phaseError : SJW);
     case PHASE_SEG1:
-      // TODO: Lengthen segment to compensate phase error (max. SJW).
+      // Lengthen segment to compensate phase error (max. SJW).
+      phaseError = min((tqSegCnt + PROP_SEG_LEN + SYNC_SEG_LEN), PHASE_SEG1_LEN);
+      phaseSeg1Len = PHASE_SEG1_LEN + ((phaseError <= SJW) ? phaseError : SJW);
       break;
     case PHASE_SEG2:
-      // TODO: Shorten segment to compensate phase error (max. SJW).
+      // Shorten segment to compensate phase error (max. SJW).
+      phaseError = min((PHASE_SEG2_LEN - tqSegCnt), PHASE_SEG2_LEN);
+      phaseSeg2Len = PHASE_SEG2_LEN - ((phaseError <= SJW) ? phaseError : SJW);
       break;
     default:
       Serial.println("Unknown segment!");
