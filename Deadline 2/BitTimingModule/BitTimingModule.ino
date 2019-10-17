@@ -11,7 +11,7 @@
 // Bit and segments lengths (time quanta).
 #define SYNC_SEG_LEN 1
 #define PROP_SEG_LEN 1
-#define PHASE_SEG1_LEN 7
+#define PHASE_SEG1_LEN 8
 #define PHASE_SEG2_LEN 7
 #define BIT_LEN (SYNC_SEG_LEN + PROP_SEG_LEN + PHASE_SEG1_LEN + PHASE_SEG2_LEN)
 
@@ -34,6 +34,8 @@ bool samplePoint = false;
 bool writingPoint = false;
 const byte hardSyncIntPin = 2;
 const byte resyncIntPin = 3;
+volatile bool hardSyncBool = false;
+volatile bool resyncBool = false;
 volatile unsigned char currentSegment = PROP_SEG;
 volatile unsigned char tqSegCnt = 0;
 volatile unsigned char phaseError = 0;
@@ -53,6 +55,8 @@ void loop() {
   bitTimingStateMachine();
   delay(TQ);
   tqSegCnt++;
+  hardSyncBool = false;
+  resyncBool = false;
 }
 
 void bitTimingStateMachine() {
@@ -67,6 +71,7 @@ void bitTimingStateMachine() {
     case PROP_SEG:
       if(tqSegCnt == PROP_SEG_LEN) {
         tqSegCnt = 0;
+        writingPoint = false;
         currentSegment = PHASE_SEG1;
       }
       break;
@@ -99,11 +104,14 @@ void restoreSegsDefaultLen() {
 }
 
 void hardSync() {
+  hardSyncBool = true;
+  writingPoint = true;
   currentSegment = PROP_SEG;
   tqSegCnt = 0;
 }
 
 void resync() {
+  resyncBool = true;
   switch(currentSegment){
     case SYNC_SEG:
       break;
@@ -129,11 +137,18 @@ void resync() {
 
 void plotValues() {
   for (int i = 0; i < 5; i++) {
+    Serial.print(tqSegCnt + 6);
+    Serial.print(' ');
     Serial.print(writingPoint ? (TRUE + 0) : (FALSE + 0));
     Serial.print(' ');
     Serial.print(samplePoint ? (TRUE - 2) : (FALSE - 2));
     Serial.print(' ');
     Serial.print(currentSegment + 2);
+    Serial.print(' ');
+    Serial.print(hardSyncBool ? (TRUE - 4) : (FALSE - 4));
+    Serial.print(' ');
+    Serial.print(resyncBool ? (TRUE - 6) : (FALSE - 6));
+    Serial.print(' ');
     Serial.print('\n');
   }
 }
