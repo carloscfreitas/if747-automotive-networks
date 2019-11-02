@@ -38,17 +38,18 @@
 
 /******* CRC check ******/
 #define CRC             16
-#define CRC_DELIMITER   17
+#define CRC_SEQUENCE    17
+#define CRC_DELIMITER   18
 /************************/
 
 /********** ACK *********/
-#define ACK             18
-#define ACK_SLOT        19
-#define ACK_DELIMITER   20
+#define ACK             19
+#define ACK_SLOT        20
+#define ACK_DELIMITER   21
 /************************/
 
 /****** End of Frame ****/
-#define END_OF_FRAME    21
+#define END_OF_FRAME    22
 /************************/
 
 #define MAX_FRAME_SIZE 127
@@ -60,6 +61,8 @@ unsigned char frameBuf[MAX_FRAME_SIZE];
 unsigned char sampledBit;
 unsigned char bitIndex = 0;
 unsigned char bitCnt   = 0;
+unsigned char error    = 0;
+unsigned char samePolarityBitCnt = 0;
 
 unsigned char RTR;
 unsigned char SRR;
@@ -72,6 +75,28 @@ void interframeSpaceStateMachine() {
     printf("Interframe space\n");
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
+            /***
+            /* If a CAN node has a message waiting for transmission and it samples a
+            /* dominant bit at the third bit of INTERMISSION, it will interpret this as
+            /* a START OF FRAME bit, and, with the next bit, start transmitting its message
+            /* with the first bit of its IDENTIFIER without first transmitting a START OF FRAME bit
+            /* and without becoming receiver.
+            /***/
+            if (samePolarityBitCnt == 2 && sampledBit == '0') {
+                currentFrameField = START_OF_FRAME;
+                decoderStateMachine();
+            } else if (sampledBit == '1') {
+                samePolarityBitCnt++;
+                if (samePolarityBitCnt == 3) {
+                    samePolarityBitCnt = 0;
+                    currentFrameField = INTERFRAME_SPACE;
+                    currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
+                }
+            } else {
+                printf("Interframe space error: ");
+                printf("Expecting 3 recessive bits during Intermission.\n");
+                error = 1;
+            }
             break;
         case INTERFRAME_SPACE_BUS_IDLE:
             if (sampledBit == '0') {
@@ -81,6 +106,7 @@ void interframeSpaceStateMachine() {
             break;
         default:
             printf("Interframe space error: invalid sub-frame field.\n");
+            error = 1;
             break;
     }
 };
@@ -106,11 +132,8 @@ void arbitrationStateMachine() {
             RTR = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameField = CONTROL;
-            if (IDE == '1') {
-                currentFrameSubField = CONTROL_r1;
-            } else {
-                currentFrameSubField = CONTROL_IDE;
-            }
+            if (IDE == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
+            else currentFrameSubField = CONTROL_IDE;    // Standard format.
             break;
         case ARBITRATION_SRR: // Empty transition to IDE bit.
             SRR = RTR;
@@ -126,6 +149,7 @@ void arbitrationStateMachine() {
             break;
         default:
             printf("Arbitration error: invalid sub-frame field.\n");
+            error = 1;
             break;
     }
 }
@@ -166,6 +190,7 @@ void controlStateMachine() {
             break;
         default:
             printf("Control error: invalid sub-frame field.\n");
+            error = 1;
             break;
     }
 }
@@ -174,7 +199,61 @@ void dataStateMachine() {
     printf("Data\n");
     frameBuf[bitIndex++] = sampledBit;
     bitCnt++;
-    if (bitCnt == 8 * DLC) currentFrameField = CRC;
+    if (bitCnt == 8 * DLC) {
+        currentFrameField = CRC;
+        currentFrameSubField = CRC_SEQUENCE;
+    }
+}
+
+// TODO
+void crcStateMachine() {
+    printf("CRC\n");
+}
+
+void ackStateMachine() {
+    printf("ACK\n");
+    switch (currentFrameSubField) {
+        case ACK_SLOT:
+            if (sampledBit == '1') { // None of the stations has acknowledged the message.
+                printf("Acknowledgment error: ");
+                printf("Failed to validade the message correctly.\n");
+                error = 1;
+            } else {
+                currentFrameSubField = ACK_DELIMITER;
+            }
+            break;
+        case ACK_DELIMITER:
+            if (error) {
+                printf("CRC error: ");
+                printf("The calculated result is not the same as that received in the CRC sequence.\n");
+            } else if (sampledBit != '1') {
+                printf("Acknowledgment delimiter error: ");
+                printf("Must be a recessive bit.\n");
+                error = 1;
+            } else {
+                currentFrameField = END_OF_FRAME;
+            }
+            break;
+        default:
+            printf("Ack error: invalid sub-frame field.\n");
+            break;
+    }
+}
+
+void endOfFrameStateMachine() {
+    printf("End of frame\n");
+    if (sampledBit == '1') {
+        samePolarityBitCnt++;
+        if (samePolarityBitCnt == 7) {
+            samePolarityBitCnt = 0;
+            currentFrameField = INTERFRAME_SPACE;
+            currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
+        }
+    } else {
+        printf("End of frame error: ");
+        printf("Expecting a flag sequence consisting of 7 recessive bits.\n");
+        error = 1;
+    }
 }
 
 void decoderStateMachine() {
@@ -195,10 +274,13 @@ void decoderStateMachine() {
             dataStateMachine();
             break;
         case CRC:
+            crcStateMachine();
             break;
         case ACK:
+            ackStateMachine();
             break;
         case END_OF_FRAME:
+            endOfFrameStateMachine();
             break;
         default:
             printf("Decoder error: invalid frame field.\n");
@@ -218,7 +300,7 @@ int main() {
     do {
         sampledBit = fgetc(fp);
         decoderStateMachine();
-    } while(feof(fp) == 0);
+    } while(feof(fp) == 0 && !error);
 
     fclose(fp);
     return 0;
