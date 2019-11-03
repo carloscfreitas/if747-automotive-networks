@@ -77,14 +77,31 @@ unsigned char DLC;
 
 void decoderStateMachine();
 
+void checkBitStuffing() {
+    sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
+    previousBit = sampledBit;
+    if (samePolarityBitCnt == 5) {
+        printf("Destuffing bit at index %d.\n", bitIndex);
+        samePolarityBitCnt = 1;
+        prevFrameField = currentFrameField;
+        currentFrameField = BIT_STUFFING;
+    }
+}
+
 void bitStuffingStateMachine() {
     if (sampledBit == previousBit) {
-        printf("Bit stuffing error.\n");
+        printf("Bit stuffing error at index %d.\n", bitIndex);
         hasError = 1;
     } else {
         samePolarityBitCnt = 1;
+        previousBit = sampledBit;
         currentFrameField = prevFrameField;
     }
+}
+
+// TODO: Implement CRC15 check.
+int validateCrcChecksum() {
+    return 1;
 }
 
 void interframeSpaceStateMachine() {
@@ -122,16 +139,19 @@ void interframeSpaceStateMachine() {
             break;
         default:
             printf("Interframe space error: invalid sub-frame field.\n");
-            hasError = 1;
-            break;
+            return;
     }
 };
 
 void startOfFrameStateMachine() {
     printf("Start of Frame\n");
     // TODO: Enable hard synchronisation.
-    bitIndex = 0;
     IDE = 0;  // Assuming Standard format.
+    DLC = 0;
+    bitIndex = 0;
+    bitCnt = 0;
+    samePolarityBitCnt = 1;
+    previousBit = sampledBit;
     frameBuf[bitIndex++] = sampledBit;
     currentFrameField = ARBITRATION;
     currentFrameSubField = ARBITRATION_IDENTIFIER_11_BIT;
@@ -139,6 +159,7 @@ void startOfFrameStateMachine() {
 
 void arbitrationStateMachine() {
     printf("Arbitration\n");
+    int shouldCheckBitStuffing = 1;
     switch (currentFrameSubField) {
         case ARBITRATION_IDENTIFIER_11_BIT:
             frameBuf[bitIndex++] = sampledBit;
@@ -154,6 +175,7 @@ void arbitrationStateMachine() {
         case ARBITRATION_SRR: // Empty transition to IDE bit.
             SRR = RTR;
             currentFrameSubField = ARBITRATION_IDE;
+            shouldCheckBitStuffing = 0; // Prevent from checking bit stuffing without having sampled a new bit.
             arbitrationStateMachine();
             break;
         case ARBITRATION_IDE: // Empty transition to 18 bit identifier.
@@ -165,21 +187,17 @@ void arbitrationStateMachine() {
             break;
         default:
             printf("Arbitration error: invalid sub-frame field.\n");
-            hasError = 1;
-            break;
+            return;
     }
     // Check bit stuffing.
-    if (!hasError) {
-        sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
-        if (samePolarityBitCnt == 5) {
-            prevFrameField = currentFrameField;
-            currentFrameField = BIT_STUFFING;
-        }
+    if (!hasError && shouldCheckBitStuffing) {
+        checkBitStuffing();
     }
 }
 
 void controlStateMachine() {
     printf("Control\n");
+    int shouldCheckBitStuffing = 1;
     switch (currentFrameSubField) {
         case CONTROL_IDE:
             IDE = sampledBit;
@@ -189,6 +207,7 @@ void controlStateMachine() {
             } else { // Extended format.
                 currentFrameField = ARBITRATION;
                 currentFrameSubField = ARBITRATION_SRR;
+                shouldCheckBitStuffing = 0; // Prevent from checking bit stuffing without having sampled a new bit.
                 arbitrationStateMachine();
             }
             break;
@@ -209,21 +228,20 @@ void controlStateMachine() {
                 DLC = fmin(DLC, 8); // Maximum number of data bytes: 8.
                 printf("%d\n", DLC);
                 if (RTR == '0') currentFrameField = DATA; // Data frame.
-                else currentFrameField = CRC; // Remote frame.
+                else {
+                    // Remote frame.
+                    currentFrameField = CRC;
+                    currentFrameSubField = CRC_SEQUENCE;
+                }
             }
             break;
         default:
             printf("Control error: invalid sub-frame field.\n");
-            hasError = 1;
-            break;
+            return;
     }
     // Check bit stuffing.
-    if (!hasError) {
-        sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
-        if (samePolarityBitCnt == 5) {
-            prevFrameField = currentFrameField;
-            currentFrameField = BIT_STUFFING;
-        }
+    if (!hasError && shouldCheckBitStuffing) {
+        checkBitStuffing();
     }
 }
 
@@ -232,38 +250,48 @@ void dataStateMachine() {
     frameBuf[bitIndex++] = sampledBit;
     bitCnt++;
     if (bitCnt == 8 * DLC) {
+        bitCnt = 15;
         currentFrameField = CRC;
         currentFrameSubField = CRC_SEQUENCE;
     }
     // Check bit stuffing.
     if (!hasError) {
-        sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
-        if (samePolarityBitCnt == 5) {
-            prevFrameField = currentFrameField;
-            currentFrameField = BIT_STUFFING;
-        }
+        checkBitStuffing();
     }
 }
 
-// TODO
 void crcStateMachine() {
     printf("CRC\n");
     switch (currentFrameSubField) {
         case CRC_SEQUENCE:
+            frameBuf[bitIndex++] = sampledBit;
+            bitCnt--;
+            if (bitCnt == 0) {
+                if (validateCrcChecksum()) {
+                    currentFrameSubField = CRC_DELIMITER;
+                } else {
+                    hasError = 1;
+                }
+            }
             break;
         case CRC_DELIMITER:
+            if (sampledBit != '1') {
+                printf("CRC delimiter error: ");
+                printf("Must be a recessive bit.\n");
+                hasError = 1;
+            } else {
+                frameBuf[bitIndex++] = sampledBit;
+                currentFrameField = ACK;
+                currentFrameSubField = ACK_SLOT;
+            }
             break;
         default:
-            printf("Ack error: invalid sub-frame field.\n");
-            break;
+            printf("CRC error: invalid sub-frame field.\n");
+            return;
     }
     // Check bit stuffing.
     if (!hasError) {
-        sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
-        if (samePolarityBitCnt == 5) {
-            prevFrameField = currentFrameField;
-            currentFrameField = BIT_STUFFING;
-        }
+        checkBitStuffing();
     }
 }
 
@@ -276,6 +304,7 @@ void ackStateMachine() {
                 printf("Failed to validade the message correctly.\n");
                 hasError = 1;
             } else {
+                frameBuf[bitIndex++] = sampledBit;
                 currentFrameSubField = ACK_DELIMITER;
             }
             break;
@@ -289,23 +318,32 @@ void ackStateMachine() {
                 hasError = 1;
             } else {
                 bitCnt = 0;
+                frameBuf[bitIndex++] = sampledBit;
                 currentFrameField = END_OF_FRAME;
             }
             break;
         default:
             printf("Ack error: invalid sub-frame field.\n");
-            break;
+            return;
     }
 }
 
 void endOfFrameStateMachine() {
     printf("End of frame\n");
     if (sampledBit == '1') {
+        frameBuf[bitIndex++] = sampledBit;
         bitCnt++;
         if (bitCnt == 7) {
             bitCnt = 0;
             currentFrameField = INTERFRAME_SPACE;
-            currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
+            currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
+
+            // Print destuffed frame.
+            int i;
+            for (int i = 0; i < bitIndex; i++) {
+                printf("%c", frameBuf[i]);
+            }
+            printf("\n");
         }
     } else {
         printf("End of frame error: ");
@@ -347,7 +385,6 @@ void decoderStateMachine() {
             printf("Decoder error: invalid frame field.\n");
             break;
     }
-    previousBit = sampledBit;
 }
 
 int main() {
@@ -361,7 +398,8 @@ int main() {
 
     do {
         sampledBit = fgetc(fp);
-        decoderStateMachine();
+        if (sampledBit == '0' || sampledBit == '1')
+            decoderStateMachine();
     } while(feof(fp) == 0 && !hasError);
 
     fclose(fp);
