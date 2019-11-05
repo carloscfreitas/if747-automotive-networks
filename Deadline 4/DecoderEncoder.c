@@ -56,6 +56,12 @@
 #define BIT_STUFFING    23
 /************************/
 
+/****** Error frame *****/
+#define ERROR           24
+#define ERROR_FLAG      25
+#define ERROR_DELIMITER 26
+/************************/
+
 #define MAX_FRAME_SIZE 127
 
 unsigned char currentFrameField    = INTERFRAME_SPACE;
@@ -138,13 +144,13 @@ void interframeSpaceStateMachine() {
             /* with the first bit of its IDENTIFIER without first transmitting a START OF FRAME bit
             /* and without becoming receiver.
             /***/
-            if (samePolarityBitCnt == 2 && sampledBit == '0') {
+            if (bitCnt == 2 && sampledBit == '0') {
                 currentFrameField = START_OF_FRAME;
                 decoderStateMachine();
             } else if (sampledBit == '1') {
-                samePolarityBitCnt++;
-                if (samePolarityBitCnt == 3) {
-                    samePolarityBitCnt = 1;
+                bitCnt++;
+                if (bitCnt == 3) {
+                    bitCnt = 0;
                     currentFrameField = INTERFRAME_SPACE;
                     currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
                 }
@@ -368,7 +374,7 @@ void endOfFrameStateMachine() {
         if (bitCnt == 7) {
             bitCnt = 0;
             currentFrameField = INTERFRAME_SPACE;
-            currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
+            currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
 
             // Print destuffed frame.
             int i;
@@ -381,6 +387,42 @@ void endOfFrameStateMachine() {
         printf("End of frame error: ");
         printf("Expecting a flag sequence consisting of 7 recessive bits.\n");
         hasError = 1;
+    }
+}
+
+void errorStateMachine() {
+    printf("Error frame\n");
+    switch(currentFrameSubField) {
+        case ERROR_FLAG:
+            // TODO: Support error flag superposition (max: 12 bits).
+            if (sampledBit == '0') {
+                bitCnt--;
+                if (bitCnt == 0) {
+                    bitCnt = 8;
+                    currentFrameSubField = ERROR_DELIMITER;
+                }
+            } else {
+                printf("Error flag error: ");
+                printf("Expecting 6 dominant bits during error flag.\n");
+                hasError = 1;
+            }
+            break;
+        case ERROR_DELIMITER:
+            if (sampledBit == '1') {
+                bitCnt--;
+                if (bitCnt == 0) {
+                    currentFrameField = INTERFRAME_SPACE;
+                    currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
+                }
+            } else {
+                printf("Error delimiter error: ");
+                printf("Expecting 8 dominant bits during error flag.\n");
+                hasError = 1;
+            }
+            break;
+        default:
+            printf("Error frame error: invalid sub-frame field.\n");
+            return;
     }
 }
 
@@ -413,9 +455,19 @@ void decoderStateMachine() {
         case BIT_STUFFING:
             bitStuffingStateMachine();
             break;
+        case ERROR:
+            errorStateMachine();
+            break;
         default:
             printf("Decoder error: invalid frame field.\n");
             break;
+    }
+    if (hasError) {
+        printf("Start receiving error flag.\n");
+        bitCnt = 6; // Size of the error flag.
+        hasError = 0;
+        currentFrameField = ERROR;
+        currentFrameSubField = ERROR_FLAG;
     }
 }
 
@@ -430,9 +482,8 @@ int main() {
 
     do {
         sampledBit = fgetc(fp);
-        if (sampledBit == '0' || sampledBit == '1')
-            decoderStateMachine();
-    } while(feof(fp) == 0 && !hasError);
+        decoderStateMachine();
+    } while(feof(fp) == 0);
 
     fclose(fp);
     return 0;
