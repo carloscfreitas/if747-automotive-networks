@@ -67,13 +67,16 @@ unsigned char sampledBit;
 unsigned char previousBit;
 unsigned char bitIndex = 0;
 unsigned char bitCnt   = 0;
-unsigned char hasError    = 0;
+unsigned char hasError = 0;
+unsigned char crcError = 0;
 unsigned char samePolarityBitCnt = 1;
 
-unsigned char RTR;
-unsigned char SRR;
-unsigned char IDE;
-unsigned char DLC;
+unsigned char rtrBit;
+unsigned char srrBit;
+unsigned char ideBit;
+unsigned char dlc;
+unsigned char crc[15] = "000000000000000";
+unsigned char generatorPolynomial[15] = "100010110011001"; // 0x4599
 
 void decoderStateMachine();
 
@@ -99,9 +102,29 @@ void bitStuffingStateMachine() {
     }
 }
 
-// TODO: Implement CRC15 check.
-int validateCrcChecksum() {
-    return 1;
+void computeCrcSequence() {
+    int i, j;
+    unsigned char nxtBit, crcNxt;
+    
+    nxtBit = sampledBit;
+    crcNxt = nxtBit ^ crc[0];
+
+    for (j = 0; j < 14; j++) {
+        crc[j] = crc[j+1];
+    }
+    crc[14] = '0';
+    if (crcNxt) {
+        for (j = 0; j < 15; j++) {
+          crc[j] = crc[j] ^ generatorPolynomial[j] ? '1' : '0';
+        }
+    }
+}
+
+int validateCrcSequence() {
+    int j;
+    for (j = 0; j < 15 && !crcError; j++) {
+        crcError = crc[j] != frameBuf[(bitIndex - 1) - 14 + j];
+    }
 }
 
 void interframeSpaceStateMachine() {
@@ -146,36 +169,44 @@ void interframeSpaceStateMachine() {
 void startOfFrameStateMachine() {
     printf("Start of Frame\n");
     // TODO: Enable hard synchronisation.
-    IDE = 0;  // Assuming Standard format.
-    DLC = 0;
+    dlc      = 0;
+    ideBit   = 0;  // Assuming Standard format.
+    bitCnt   = 0;
     bitIndex = 0;
-    bitCnt = 0;
+    crcError = 0;
+    hasError = 0;
     samePolarityBitCnt = 1;
     previousBit = sampledBit;
     frameBuf[bitIndex++] = sampledBit;
     currentFrameField = ARBITRATION;
     currentFrameSubField = ARBITRATION_IDENTIFIER_11_BIT;
+    // Reset CRC sequence.
+    int j;
+    for (j = 0; j < 15; j++) {
+        crc[j] = '0';
+    }
+    computeCrcSequence();
 };
 
 void arbitrationStateMachine() {
     printf("Arbitration\n");
-    int shouldCheckBitStuffing = 1;
+    int skipState = 0;
     switch (currentFrameSubField) {
         case ARBITRATION_IDENTIFIER_11_BIT:
             frameBuf[bitIndex++] = sampledBit;
             if (bitIndex == 12) currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
             break;
         case ARBITRATION_RTR:
-            RTR = sampledBit;
+            rtrBit = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameField = CONTROL;
-            if (IDE == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
+            if (ideBit == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
             else currentFrameSubField = CONTROL_IDE;    // Standard format.
             break;
-        case ARBITRATION_SRR: // Empty transition to IDE bit.
-            SRR = RTR;
+        case ARBITRATION_SRR: // Empty transition to IDE bit field.
+            srrBit = rtrBit;
             currentFrameSubField = ARBITRATION_IDE;
-            shouldCheckBitStuffing = 0; // Prevent from checking bit stuffing without having sampled a new bit.
+            skipState = 1; // Prevent from doing further evaluation without having sampled a new bit.
             arbitrationStateMachine();
             break;
         case ARBITRATION_IDE: // Empty transition to 18 bit identifier.
@@ -189,25 +220,26 @@ void arbitrationStateMachine() {
             printf("Arbitration error: invalid sub-frame field.\n");
             return;
     }
-    // Check bit stuffing.
-    if (!hasError && shouldCheckBitStuffing) {
+    // Compute CRC sequence and check bit stuffing.
+    if (!hasError && !skipState) {
+        computeCrcSequence();
         checkBitStuffing();
     }
 }
 
 void controlStateMachine() {
     printf("Control\n");
-    int shouldCheckBitStuffing = 1;
+    int skipState = 0;
     switch (currentFrameSubField) {
         case CONTROL_IDE:
-            IDE = sampledBit;
+            ideBit = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
-            if (IDE == '0') { // Standard format.
+            if (ideBit == '0') { // Standard format.
                 currentFrameSubField = CONTROL_r0;
             } else { // Extended format.
                 currentFrameField = ARBITRATION;
                 currentFrameSubField = ARBITRATION_SRR;
-                shouldCheckBitStuffing = 0; // Prevent from checking bit stuffing without having sampled a new bit.
+                skipState = 1; // Prevent from doing further evaluation without having sampled a new bit.
                 arbitrationStateMachine();
             }
             break;
@@ -223,13 +255,14 @@ void controlStateMachine() {
         case CONTROL_DLC:
             frameBuf[bitIndex++] = sampledBit;
             bitCnt--;
-            DLC += ((sampledBit - '0') << bitCnt);
+            dlc += ((sampledBit - '0') << bitCnt);
             if (bitCnt == 0) {
-                DLC = fmin(DLC, 8); // Maximum number of data bytes: 8.
-                printf("%d\n", DLC);
-                if (RTR == '0') currentFrameField = DATA; // Data frame.
+                dlc = fmin(dlc, 8); // Maximum number of data bytes: 8.
+                printf("%d\n", dlc);
+                if (rtrBit == '0') currentFrameField = DATA; // Data frame.
                 else {
-                    // Remote frame.
+                    // Remote frame. Transitioning to CRC sequence. 
+                    bitCnt = 15;
                     currentFrameField = CRC;
                     currentFrameSubField = CRC_SEQUENCE;
                 }
@@ -239,8 +272,9 @@ void controlStateMachine() {
             printf("Control error: invalid sub-frame field.\n");
             return;
     }
-    // Check bit stuffing.
-    if (!hasError && shouldCheckBitStuffing) {
+    // Compute CRC sequence and check bit stuffing.
+    if (!hasError && !skipState) {
+        computeCrcSequence();
         checkBitStuffing();
     }
 }
@@ -249,13 +283,14 @@ void dataStateMachine() {
     printf("Data\n");
     frameBuf[bitIndex++] = sampledBit;
     bitCnt++;
-    if (bitCnt == 8 * DLC) {
+    if (bitCnt == 8 * dlc) {
         bitCnt = 15;
         currentFrameField = CRC;
         currentFrameSubField = CRC_SEQUENCE;
     }
-    // Check bit stuffing.
+    // Compute CRC sequence and check bit stuffing.
     if (!hasError) {
+        computeCrcSequence();
         checkBitStuffing();
     }
 }
@@ -267,12 +302,12 @@ void crcStateMachine() {
             frameBuf[bitIndex++] = sampledBit;
             bitCnt--;
             if (bitCnt == 0) {
-                if (validateCrcChecksum()) {
-                    currentFrameSubField = CRC_DELIMITER;
-                } else {
-                    hasError = 1;
-                }
+                validateCrcSequence();
+                currentFrameSubField = CRC_DELIMITER;
             }
+            // Check bit stuffing.
+            if (!hasError)
+                checkBitStuffing();
             break;
         case CRC_DELIMITER:
             if (sampledBit != '1') {
@@ -288,10 +323,6 @@ void crcStateMachine() {
         default:
             printf("CRC error: invalid sub-frame field.\n");
             return;
-    }
-    // Check bit stuffing.
-    if (!hasError) {
-        checkBitStuffing();
     }
 }
 
@@ -309,9 +340,10 @@ void ackStateMachine() {
             }
             break;
         case ACK_DELIMITER:
-            if (hasError) {
+            if (crcError) {
                 printf("CRC error: ");
                 printf("The calculated result is not the same as that received in the CRC sequence.\n");
+                hasError = 1;
             } else if (sampledBit != '1') {
                 printf("Acknowledgment delimiter error: ");
                 printf("Must be a recessive bit.\n");
