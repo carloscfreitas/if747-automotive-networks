@@ -62,6 +62,12 @@
 #define ERROR_DELIMITER 26
 /************************/
 
+/***** Overload frame ******/
+#define OVERLOAD           27
+#define OVERLOAD_FLAG      28
+#define OVERLOAD_DELIMITER 29
+/***************************/
+
 #define MAX_FRAME_SIZE 127
 
 unsigned char currentFrameField    = INTERFRAME_SPACE;
@@ -75,6 +81,7 @@ unsigned char bitIndex = 0;
 unsigned char bitCnt   = 0;
 unsigned char hasError = 0;
 unsigned char crcError = 0;
+unsigned char overloadFrameCnt   = 0;
 unsigned char samePolarityBitCnt = 1;
 
 unsigned char rtrBit;
@@ -115,10 +122,12 @@ void computeCrcSequence() {
     nxtBit = sampledBit;
     crcNxt = nxtBit ^ crc[0];
 
+    // Shift left by one position.
     for (j = 0; j < 14; j++) {
         crc[j] = crc[j+1];
     }
     crc[14] = '0';
+
     if (crcNxt) {
         for (j = 0; j < 15; j++) {
           crc[j] = crc[j] ^ generatorPolynomial[j] ? '1' : '0';
@@ -137,16 +146,35 @@ void interframeSpaceStateMachine() {
     printf("Interframe space\n");
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
-            /***
-            /* If a CAN node has a message waiting for transmission and it samples a
-            /* dominant bit at the third bit of INTERMISSION, it will interpret this as
-            /* a START OF FRAME bit, and, with the next bit, start transmitting its message
-            /* with the first bit of its IDENTIFIER without first transmitting a START OF FRAME bit
-            /* and without becoming receiver.
-            /***/
-            if (bitCnt == 2 && sampledBit == '0') {
-                currentFrameField = START_OF_FRAME;
-                decoderStateMachine();
+            if (sampledBit == '0') {
+                if (bitCnt == 2) {
+                    /***
+                    /* If a CAN node has a message waiting for transmission and it samples a
+                    /* dominant bit at the third bit of INTERMISSION, it will interpret this as
+                    /* a START OF FRAME bit, and, with the next bit, start transmitting its message
+                    /* with the first bit of its IDENTIFIER without first transmitting a START OF FRAME bit
+                    /* and without becoming receiver.
+                    /***/
+                    currentFrameField = START_OF_FRAME;
+                    decoderStateMachine();
+                } else {
+                    overloadFrameCnt++;
+                    if (overloadFrameCnt <= 2) {
+                        // Overload frame.
+                        currentFrameField = OVERLOAD;
+                        currentFrameSubField = OVERLOAD_FLAG;
+                        if (bitCnt == 0) {
+                            bitCnt = 6; // Overload flag length.
+                            decoderStateMachine();
+                        } else {
+                            bitCnt = 6; // Overload flag length.
+                        }
+                    } else {
+                        printf("Overload error: ");
+                        printf("Maximum of 2 Overload frames allowed to delay Data/Remote frame.\n");
+                        hasError = 1;
+                    }
+                }
             } else if (sampledBit == '1') {
                 bitCnt++;
                 if (bitCnt == 3) {
@@ -181,6 +209,7 @@ void startOfFrameStateMachine() {
     bitIndex = 0;
     crcError = 0;
     hasError = 0;
+    overloadFrameCnt   = 0;
     samePolarityBitCnt = 1;
     previousBit = sampledBit;
     frameBuf[bitIndex++] = sampledBit;
@@ -265,7 +294,7 @@ void controlStateMachine() {
             if (bitCnt == 0) {
                 dlc = fmin(dlc, 8); // Maximum number of data bytes: 8.
                 printf("%d\n", dlc);
-                if (rtrBit == '0') currentFrameField = DATA; // Data frame.
+                if (rtrBit == '0' && dlc != 0) currentFrameField = DATA; // Data frame.
                 else {
                     // Remote frame. Transitioning to CRC sequence. 
                     bitCnt = 15;
@@ -394,16 +423,21 @@ void errorStateMachine() {
     printf("Error frame\n");
     switch(currentFrameSubField) {
         case ERROR_FLAG:
-            // TODO: Support error flag superposition (max: 12 bits).
             if (sampledBit == '0') {
-                bitCnt--;
-                if (bitCnt == 0) {
-                    bitCnt = 8;
+                bitCnt++;
+            } else if (sampledBit == '1') {
+                if (bitCnt < 6) {
+                    printf("Error flag error: ");
+                    printf("Expecting at least 6 equal bits during error flag.\n");
+                    hasError = 1;
+                } else if (bitCnt >= 6 && bitCnt <= 12) {
+                    bitCnt = 7;
                     currentFrameSubField = ERROR_DELIMITER;
                 }
-            } else {
+            }
+            if (bitCnt > 12) {
                 printf("Error flag error: ");
-                printf("Expecting 6 dominant bits during error flag.\n");
+                printf("Expecting maximum of 12 equal bits during error flag.\n");
                 hasError = 1;
             }
             break;
@@ -416,12 +450,47 @@ void errorStateMachine() {
                 }
             } else {
                 printf("Error delimiter error: ");
-                printf("Expecting 8 dominant bits during error flag.\n");
+                printf("Expecting 8 recessive bits during error delimiter.\n");
                 hasError = 1;
             }
             break;
         default:
             printf("Error frame error: invalid sub-frame field.\n");
+            return;
+    }
+}
+
+void overloadStateMachine() {
+    printf("Overload frame\n");
+    switch(currentFrameSubField) {
+        case OVERLOAD_FLAG:
+            if (sampledBit == '0') {
+                bitCnt--;
+                if (bitCnt == 0) {
+                    bitCnt = 8;
+                    currentFrameSubField = OVERLOAD_DELIMITER;
+                }
+            } else if (sampledBit == '1') {
+                printf("Overload flag error: ");
+                printf("Expecting 6 dominant bits during overload flag.\n");
+                hasError = 1;
+            }
+            break;
+        case OVERLOAD_DELIMITER:
+            if (sampledBit == '1') {
+                bitCnt--;
+                if (bitCnt == 0) {
+                    currentFrameField = INTERFRAME_SPACE;
+                    currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
+                }
+            } else {
+                printf("Overload delimiter error: ");
+                printf("Expecting 8 recessive bits during overload delimiter.\n");
+                hasError = 1;
+            }
+            break;
+        default:
+            printf("Overload frame error: invalid sub-frame field.\n");
             return;
     }
 }
@@ -458,13 +527,16 @@ void decoderStateMachine() {
         case ERROR:
             errorStateMachine();
             break;
+        case OVERLOAD:
+            overloadStateMachine();
+            break;
         default:
             printf("Decoder error: invalid frame field.\n");
             break;
     }
     if (hasError) {
-        printf("Start receiving error flag.\n");
-        bitCnt = 6; // Size of the error flag.
+        printf("Start receiving error flag...\n");
+        bitCnt = 0;
         hasError = 0;
         currentFrameField = ERROR;
         currentFrameSubField = ERROR_FLAG;
