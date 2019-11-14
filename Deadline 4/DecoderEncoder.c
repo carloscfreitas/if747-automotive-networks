@@ -76,6 +76,7 @@ unsigned char prevFrameField;
 
 unsigned char frameBuf[MAX_FRAME_SIZE];
 unsigned char sampledBit;
+unsigned char writingBit;
 unsigned char previousBit;
 unsigned char bitIndex = 0;
 unsigned char bitCnt   = 0;
@@ -608,9 +609,162 @@ void decoderStateMachine() {
     }
 }
 
+void checkBitStuffingEncoder() {
+    writingBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
+    previousBit = writingBit;
+    if (samePolarityBitCnt == 5) {
+        samePolarityBitCnt = 1;
+        prevFrameField = currentFrameField;
+        currentFrameField = BIT_STUFFING;
+    }
+}
+
+void encoderStateMachine() {
+    switch(currentFrameField) {
+        case START_OF_FRAME:
+            writingBit = '0';
+            bitIndexStruct = 0;
+            samePolarityBitCnt = 1;
+            previousBit = writingBit;
+            currentFrameField = ARBITRATION;
+            currentFrameSubField = ARBITRATION_IDENTIFIER_11_BIT;
+            break;
+        case ARBITRATION:
+            switch (currentFrameSubField) {
+                case ARBITRATION_IDENTIFIER_11_BIT:
+                    writingBit = receivedFrame.idA[bitIndexStruct++];
+                    if (bitIndexStruct == 11) {
+                        bitIndexStruct = 0;
+                        if (receivedFrame.ide == '0') {
+                            currentFrameSubField = ARBITRATION_RTR;
+                        } else if (receivedFrame.ide == '1') {
+                            currentFrameSubField = ARBITRATION_SRR;
+                        }
+                    }
+                    break;
+                case ARBITRATION_RTR:
+                    writingBit = receivedFrame.rtr;
+                    currentFrameField = CONTROL;
+                    if (receivedFrame.ide == '0') {
+                        currentFrameSubField = CONTROL_IDE;
+                    } else if (receivedFrame.ide == '1') {
+                        currentFrameSubField = CONTROL_r1;
+                    }
+                    break;
+                case ARBITRATION_SRR:
+                    writingBit = receivedFrame.srr;
+                    currentFrameSubField = ARBITRATION_IDE;
+                    break;
+                case ARBITRATION_IDE:
+                    writingBit = receivedFrame.ide;
+                    currentFrameSubField = ARBITRATION_IDENTIFIER_18_BIT;
+                    break;
+                case ARBITRATION_IDENTIFIER_18_BIT:
+                    writingBit = receivedFrame.idB[bitIndexStruct++];
+                    if (bitIndexStruct == 18) {
+                        bitIndexStruct = 0;
+                        currentFrameSubField = ARBITRATION_RTR;
+                    }
+                    break;
+            }
+            checkBitStuffingEncoder();
+            break;
+        case CONTROL:
+            switch (currentFrameSubField) {
+                case CONTROL_IDE:
+                    writingBit = receivedFrame.ide;
+                    currentFrameSubField = CONTROL_r0;
+                    break;
+                case CONTROL_r1:
+                    writingBit = receivedFrame.r1;
+                    currentFrameSubField = CONTROL_r0;
+                    break;
+                case CONTROL_r0:
+                    writingBit = receivedFrame.r0;
+                    currentFrameSubField = CONTROL_DLC;
+                    dlc = 0;
+                    break;
+                case CONTROL_DLC:
+                    writingBit = receivedFrame.dlc[bitIndexStruct++];
+                    dlc += ((writingBit - '0') << (4 - bitIndexStruct));
+                    if (bitIndexStruct == 4) {
+                        dlc = fmin(dlc, 8);
+                        bitIndexStruct = 0;
+                        if (receivedFrame.rtr == '0' && dlc != 0) {
+                            currentFrameField = DATA; // Data frame.
+                        } else {
+                            // Remote frame. Transitioning to CRC sequence. 
+                            currentFrameField = CRC;
+                            currentFrameSubField = CRC_SEQUENCE;
+                        }
+                    }
+                    break;
+            }
+            checkBitStuffingEncoder();
+            break;
+        case DATA:
+            writingBit = receivedFrame.data[bitIndexStruct++];
+            if (bitIndexStruct == 8 * dlc) {
+                bitIndexStruct = 0;
+                currentFrameField = CRC;
+                currentFrameSubField = CRC_SEQUENCE;
+            }
+            checkBitStuffingEncoder();
+            break;
+        case CRC:
+            switch (currentFrameSubField) {
+                case CRC_SEQUENCE:
+                    writingBit = receivedFrame.crc[bitIndexStruct++];
+                    if (bitIndexStruct == 15) {
+                        bitIndexStruct = 0;
+                        currentFrameSubField = CRC_DELIMITER;
+                    }
+                    checkBitStuffingEncoder();
+                    break;
+                case CRC_DELIMITER:
+                    writingBit = '1';
+                    currentFrameField = ACK;
+                    currentFrameSubField = ACK_SLOT;
+                    break;
+            }
+            break;
+        case ACK:
+            switch (currentFrameSubField) {
+                case ACK_SLOT:
+                    writingBit = '1';
+                    currentFrameSubField = ACK_DELIMITER;
+                    break;
+                case ACK_DELIMITER:
+                    writingBit = '1';
+                    currentFrameField = END_OF_FRAME;
+                    break;
+            }
+            break;
+        case END_OF_FRAME:
+            writingBit = '1';
+            bitIndexStruct++;
+            if (bitIndexStruct == 7) {
+                bitIndexStruct = 0;
+                currentFrameField = INTERFRAME_SPACE;
+                currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
+            }
+            break;
+        case BIT_STUFFING:
+            writingBit = (!(previousBit - '0')) + '0'; // The opposite polarity from the previous bit.
+            samePolarityBitCnt = 1;
+            previousBit = writingBit;
+            currentFrameField = prevFrameField;
+            break;
+        default:
+            printf("Encoder error: invalid frame field.\n");
+            break;
+    }
+}
+
 int main() {
+    int i;
     FILE *fp;
-    fp = fopen("can_bus.txt", "r");
+    fp = fopen("can_bus.txt", "r+");
     
     if (fp == NULL) {
         printf("Error while opening the file.\n");
@@ -621,6 +775,14 @@ int main() {
         sampledBit = fgetc(fp);
         decoderStateMachine();
     } while(feof(fp) == 0);
+
+    currentFrameField = START_OF_FRAME;
+    fputc('\n', fp);
+
+    do {
+        encoderStateMachine();
+        fputc(writingBit, fp);
+    } while (currentFrameField != INTERFRAME_SPACE);
 
     fclose(fp);
     return 0;
