@@ -83,13 +83,13 @@ unsigned char bitCnt   = 0;
 unsigned char hasError = 0;
 unsigned char crcError = 0;
 unsigned char isTransmitter      = 0;
-unsigned char bitFieldIndex     = 0;
+unsigned char bitFieldIndex      = 0;
 unsigned char overloadFrameCnt   = 0;
 unsigned char samePolarityBitCnt = 1;
 
 unsigned char dlc;
 unsigned char crc[15] = "000000000000000";
-unsigned char generatorPolynomial[15] = "100010110011001"; // 0x4599
+const unsigned char generatorPolynomial[15] = "100010110011001"; // 0x4599
 
 struct Frame {
     unsigned char idA[11];
@@ -105,10 +105,13 @@ struct Frame {
 };
 
 struct Frame frame;
+struct Frame receivedframe;
+
+const unsigned char errorOverloadFrame[14] = "00000011111111";
 
 void decoderStateMachine();
 
-void printFrameInfo() {
+void printFrameInfo(struct Frame frame) {
     int i;
     printf("\n------- FRAME INFO -------\n");
     printf("ID (11-bit): ");
@@ -174,11 +177,11 @@ void checkBitStuffing() {
 }
 
 void bitStuffingStateMachine() {
-    printf("Stuffed bit: %c\n", sampledBit);
     if (sampledBit == previousBit) {
         printf("Bit stuffing error at index %d.\n", bitIndex);
         hasError = 1;
     } else {
+        printf("Stuffed bit: %c\n", sampledBit);
         samePolarityBitCnt = 1;
         previousBit = sampledBit;
         currentFrameField = prevFrameField;
@@ -208,7 +211,7 @@ void computeCrcSequence() {
 int validateCrcSequence() {
     int j;
     for (j = 0; j < 15 && !crcError; j++) {
-        crcError = crc[j] != frame.crc[j];
+        crcError = crc[j] != receivedframe.crc[j];
     }
 }
 
@@ -251,7 +254,8 @@ void interframeSpaceStateMachine() {
                     bitCnt = 0;
                     // TODO: Create logic to decide wheter or not to transmit a frame after receiving one.
                     if ((isTransmitter = 1)) { // Forcing transmission after receiving a frame.
-                        currentFrameField = START_OF_FRAME;                        
+                        currentFrameField = START_OF_FRAME;
+                        frame = receivedframe;  // Send back the received frame.
                     } else {
                         currentFrameField = INTERFRAME_SPACE;
                         currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
@@ -284,7 +288,7 @@ void startOfFrameStateMachine() {
     bitIndex = 0;
     crcError = 0;
     hasError = 0;
-    frame.ide ?: 0;  // Assuming Standard format when in Receiver mode.
+    receivedframe.ide ?: 0;  // Assuming Standard format when in Receiver mode.
     bitFieldIndex     = 0;
     overloadFrameCnt   = 0;
     samePolarityBitCnt = 1;
@@ -305,29 +309,29 @@ void arbitrationStateMachine() {
     switch (currentFrameSubField) {
         case ARBITRATION_IDENTIFIER_11_BIT:
             frameBuf[bitIndex++] = sampledBit;
-            frame.idA[bitFieldIndex++] = sampledBit;
+            receivedframe.idA[bitFieldIndex++] = sampledBit;
             if (bitFieldIndex == 11) {
                 bitFieldIndex = 0;
                 if (isTransmitter) {
-                    currentFrameSubField = (frame.ide == '0') ? ARBITRATION_RTR : ARBITRATION_SRR;
+                    currentFrameSubField = (receivedframe.ide == '0') ? ARBITRATION_RTR : ARBITRATION_SRR;
                 } else {
                     currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
                 }
             }
             break;
         case ARBITRATION_RTR:
-            frame.rtr = sampledBit;
+            receivedframe.rtr = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameField = CONTROL;
-            if (frame.ide == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
+            if (receivedframe.ide == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
             else currentFrameSubField = CONTROL_IDE;    // Standard format.
             break;
         case ARBITRATION_SRR: // Empty transition to IDE bit field.
             currentFrameSubField = ARBITRATION_IDE;
             if (isTransmitter) {
-                frame.srr = sampledBit;
+                receivedframe.srr = sampledBit;
             } else {
-                frame.srr = frame.rtr;
+                receivedframe.srr = receivedframe.rtr;
                 skipState = 1; // Prevent from doing further evaluation without having sampled a new bit.
                 arbitrationStateMachine();
             }
@@ -338,7 +342,7 @@ void arbitrationStateMachine() {
             break;
         case ARBITRATION_IDENTIFIER_18_BIT:
             frameBuf[bitIndex++] = sampledBit;
-            frame.idB[bitFieldIndex++] = sampledBit;
+            receivedframe.idB[bitFieldIndex++] = sampledBit;
             if (bitFieldIndex == 18) currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
             break;
         default:
@@ -357,9 +361,9 @@ void controlStateMachine() {
     int skipState = 0;
     switch (currentFrameSubField) {
         case CONTROL_IDE:
-            frame.ide = sampledBit;
+            receivedframe.ide = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
-            if (frame.ide == '0') { // Standard format.
+            if (receivedframe.ide == '0') { // Standard format.
                 currentFrameSubField = CONTROL_r0;
             } else { // Extended format.
                 currentFrameField = ARBITRATION;
@@ -369,12 +373,12 @@ void controlStateMachine() {
             }
             break;
         case CONTROL_r1:
-            frame.r1 = sampledBit;
+            receivedframe.r1 = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameSubField = CONTROL_r0;
             break;
         case CONTROL_r0:
-            frame.r0 = sampledBit;
+            receivedframe.r0 = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameSubField = CONTROL_DLC;
             bitFieldIndex = 0;
@@ -382,14 +386,14 @@ void controlStateMachine() {
             break;
         case CONTROL_DLC:
             frameBuf[bitIndex++] = sampledBit;
-            frame.dlc[bitFieldIndex++] = sampledBit;
+            receivedframe.dlc[bitFieldIndex++] = sampledBit;
             bitCnt--;
             dlc += ((sampledBit - '0') << bitCnt);
             if (bitCnt == 0) {
                 dlc = fmin(dlc, 8); // Maximum number of data bytes: 8.
                 printf("%d\n", dlc);
                 bitFieldIndex = 0;
-                if (frame.rtr == '0' && dlc != 0) currentFrameField = DATA; // Data frame.
+                if (receivedframe.rtr == '0' && dlc != 0) currentFrameField = DATA; // Data frame.
                 else {
                     // Remote frame. Transitioning to CRC sequence. 
                     bitCnt = 15;
@@ -412,7 +416,7 @@ void controlStateMachine() {
 void dataStateMachine() {
     printf("Data\n");
     frameBuf[bitIndex++] = sampledBit;
-    frame.data[bitFieldIndex++] = sampledBit;
+    receivedframe.data[bitFieldIndex++] = sampledBit;
     bitCnt++;
     if (bitCnt == 8 * dlc) {
         bitCnt = 15;
@@ -432,7 +436,7 @@ void crcStateMachine() {
     switch (currentFrameSubField) {
         case CRC_SEQUENCE:
             frameBuf[bitIndex++] = sampledBit;
-            frame.crc[bitFieldIndex++] = sampledBit;
+            receivedframe.crc[bitFieldIndex++] = sampledBit;
             bitCnt--;
             if (bitCnt == 0) {
                 validateCrcSequence();
@@ -500,7 +504,7 @@ void endOfFrameStateMachine() {
         bitCnt++;
         if (bitCnt == 7) {
             bitCnt = 0;
-            printFrameInfo();
+            printFrameInfo(receivedframe);
             currentFrameField = INTERFRAME_SPACE;
             currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
             isTransmitter = 0;  // Disabling transmission.
@@ -628,10 +632,12 @@ void decoderStateMachine() {
             break;
     }
     if (hasError) {
-        printFrameInfo();
+        printFrameInfo(receivedframe);
         printf("Start receiving error flag...\n");
         bitCnt = 0;
         hasError = 0;
+        isTransmitter = 1;
+        bitFieldIndex = 0;
         currentFrameField = ERROR;
         currentFrameSubField = ERROR_FLAG;
     }
@@ -640,7 +646,7 @@ void decoderStateMachine() {
 void encoderStateMachine() {
     switch (currentFrameField) {
         case START_OF_FRAME:
-            printFrameInfo();
+            printFrameInfo(frame);
             writingBit = '0';
             break;
         case ARBITRATION:
@@ -709,8 +715,16 @@ void encoderStateMachine() {
         case BIT_STUFFING:
             writingBit = (!(previousBit - '0')) + '0'; // The opposite polarity from the previous bit.
             break;
+        case ERROR:
+        case OVERLOAD:
+            writingBit = errorOverloadFrame[bitFieldIndex++];
+            if (bitFieldIndex == 14) {
+                bitFieldIndex = 0;
+                isTransmitter = 0;
+            }
+            break;
         default:
-            printf("Encoder error: invalid frame field.\n");
+            printf("Encoder error: invalid frame field %d.\n", currentFrameField);
             break;
     }
 }
@@ -719,7 +733,7 @@ int main() {
     int i;
     FILE *fp;
 
-    fp = fopen("can_bus.txt", "r+");
+    fp = fopen("can_bus.txt", "r");
     
     if (fp == NULL) {
         printf("Error while opening the file.\n");
@@ -734,7 +748,7 @@ int main() {
             sampledBit = fgetc(fp);
         }
         decoderStateMachine();
-    } while (!isTransmitter || (isTransmitter && currentFrameField != END_OF_FRAME));
+    } while (feof(fp) == 0 || isTransmitter);
 
     fclose(fp);
     return 0;
