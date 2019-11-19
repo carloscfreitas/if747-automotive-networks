@@ -1,6 +1,7 @@
 /**
 /* CAN Controller.
 /**/
+#include "TimerOne.h"
 
 // Defining segments.
 #define SYNC_SEG 0
@@ -11,16 +12,16 @@
 // Bit and segments lengths (time quanta).
 #define SYNC_SEG_LEN 1
 #define PROP_SEG_LEN 1
-#define PHASE_SEG1_LEN 8
+#define PHASE_SEG1_LEN 7
 #define PHASE_SEG2_LEN 7
 #define BIT_LEN (SYNC_SEG_LEN + PROP_SEG_LEN + PHASE_SEG1_LEN + PHASE_SEG2_LEN)
 
 #define SJW 1 // Synchronization Jump Width (dafault: 1 TQ).
 #define BAUD_RATE 10 // Baud rate (default: 10 bps).
 
-// Defining time quantum length (milliseconds).
-// For a 10bps baud rate and 16 TQ bit length, time quantum must be 6,25 milliseconds.
-#define TQ 1000.0/(BAUD_RATE*BIT_LEN)
+// Defining time quantum length (microseconds).
+// For a 10bps baud rate and 16 TQ bit length, time quantum must be 6250 microseconds.
+#define TQ 1000000.0/(BAUD_RATE*BIT_LEN)
 
 // Another way to define TQ:
 //#define BRP 50000 // Baud rate prescaler (default: 50000).
@@ -99,6 +100,9 @@
 
 #define MAX_FRAME_SIZE 127
 
+#define RECEIVE_PID 0x01
+#define SEND_PID    0x02
+
 unsigned char currentFrameField    = INTERFRAME_SPACE;
 unsigned char currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
 unsigned char prevFrameField;
@@ -139,8 +143,6 @@ Frame receivedframe;
 const unsigned char errorOverloadFrame[] = "00000011111111";
 bool samplePoint = false;
 bool writingPoint = false;
-const byte hardSyncIntPin = 2;
-const byte resyncIntPin   = 3;
 volatile bool hardSyncBool  = false;
 volatile bool resyncBool    = false;
 volatile unsigned char currentSegment = PROP_SEG;
@@ -151,34 +153,20 @@ volatile unsigned char phaseSeg2Len   = PHASE_SEG2_LEN;
 
 void setup() {
     Serial.begin(2400);
-    pinMode(hardSyncIntPin, INPUT_PULLUP);
-    pinMode(resyncIntPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(hardSyncIntPin), hardSync, FALLING);
-    attachInterrupt(digitalPinToInterrupt(resyncIntPin), resync, FALLING);
+    Timer1.initialize(TQ);         // initialize timer1, and set a TQ second period
+    Timer1.attachInterrupt(bitTimingStateMachine);  // attaches bitTimingStateMachine() as a timer overflow interrupt
 }
 
 void loop() {
-    plotValues();
-    bitTimingStateMachine();
-    delay(TQ);
-    tqSegCnt++;
-    hardSyncBool = false;
-    resyncBool = false;
-    if (writingPoint && isTransmitter) {
-        encoderStateMachine();
-        // Write bit.
-    }
-    if (samplePoint) {
-        // Sample bit.
-        decoderStateMachine();
-    }
+
 }
 
 void checkBitStuffing() {
     sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
     previousBit = sampledBit;
     if (samePolarityBitCnt == 5) {
-        printf("Destuffing next bit at index %d.\n", bitIndex);
+        Serial.print("Destuffing next bit at index ");
+        Serial.println(bitIndex);
         samePolarityBitCnt = 1;
         prevFrameField = currentFrameField;
         currentFrameField = BIT_STUFFING;
@@ -187,10 +175,12 @@ void checkBitStuffing() {
 
 void bitStuffingStateMachine() {
     if (sampledBit == previousBit) {
-        printf("Bit stuffing error at index %d.\n", bitIndex);
+        Serial.print("Bit stuffing error at index ");
+        Serial.println(bitIndex);
         hasError = 1;
     } else {
-        printf("Stuffed bit: %c\n", sampledBit);
+        Serial.print("Stuffed bit: ");
+        Serial.println(sampledBit);
         samePolarityBitCnt = 1;
         previousBit = sampledBit;
         currentFrameField = prevFrameField;
@@ -225,7 +215,7 @@ int validateCrcSequence() {
 }
 
 void interframeSpaceStateMachine() {
-    printf("Interframe space\n");
+    Serial.println("Interframe space");
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
             if (sampledBit == '0') {
@@ -252,8 +242,8 @@ void interframeSpaceStateMachine() {
                             bitCnt = 6; // Overload flag length.
                         }
                     } else {
-                        printf("Overload error: ");
-                        printf("Maximum of 2 Overload frames allowed to delay Data/Remote frame.\n");
+                        Serial.print("Overload error: ");
+                        Serial.println("Maximum of 2 Overload frames allowed to delay Data/Remote frame.");
                         hasError = 1;
                     }
                 }
@@ -272,8 +262,8 @@ void interframeSpaceStateMachine() {
                     }
                 }
             } else {
-                printf("Interframe space error: ");
-                printf("Expecting 3 recessive bits during Intermission.\n");
+                Serial.print("Interframe space error: ");
+                Serial.println("Expecting 3 recessive bits during Intermission.");
                 hasError = 1;
             }
             break;
@@ -285,13 +275,13 @@ void interframeSpaceStateMachine() {
             }
             break;
         default:
-            printf("Interframe space error: invalid sub-frame field.\n");
+            Serial.println("Interframe space error: invalid sub-frame field.");
             return;
     }
 };
 
 void startOfFrameStateMachine() {
-    printf("Start of Frame\n");
+    Serial.println("Start of Frame");
     int j;
     dlc      = 0;
     bitCnt   = 0;
@@ -314,7 +304,7 @@ void startOfFrameStateMachine() {
 };
 
 void arbitrationStateMachine() {
-    printf("Arbitration\n");
+    Serial.println("Arbitration");
     int skipState = 0;
     switch (currentFrameSubField) {
         case ARBITRATION_IDENTIFIER_11_BIT:
@@ -356,7 +346,7 @@ void arbitrationStateMachine() {
             if (bitFieldIndex == 18) currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
             break;
         default:
-            printf("Arbitration error: invalid sub-frame field.\n");
+            Serial.println("Arbitration error: invalid sub-frame field.");
             return;
     }
     // Compute CRC sequence and check bit stuffing.
@@ -367,7 +357,7 @@ void arbitrationStateMachine() {
 }
 
 void controlStateMachine() {
-    printf("Control\n");
+    Serial.println("Control");
     int skipState = 0;
     switch (currentFrameSubField) {
         case CONTROL_IDE:
@@ -401,7 +391,7 @@ void controlStateMachine() {
             dlc += ((sampledBit - '0') << bitCnt);
             if (bitCnt == 0) {
                 dlc = min(dlc, 8); // Maximum number of data bytes: 8.
-                printf("%d\n", dlc);
+                Serial.println(dlc);
                 bitFieldIndex = 0;
                 if (receivedframe.rtr == '0' && dlc != 0) currentFrameField = DATA; // Data frame.
                 else {
@@ -413,7 +403,7 @@ void controlStateMachine() {
             }
             break;
         default:
-            printf("Control error: invalid sub-frame field.\n");
+            Serial.println("Control error: invalid sub-frame field.");
             return;
     }
     // Compute CRC sequence and check bit stuffing.
@@ -424,7 +414,7 @@ void controlStateMachine() {
 }
 
 void dataStateMachine() {
-    printf("Data\n");
+    Serial.println("Data");
     frameBuf[bitIndex++] = sampledBit;
     receivedframe.data[bitFieldIndex++] = sampledBit;
     bitCnt++;
@@ -442,7 +432,7 @@ void dataStateMachine() {
 }
 
 void crcStateMachine() {
-    printf("CRC\n");
+    Serial.println("CRC");
     switch (currentFrameSubField) {
         case CRC_SEQUENCE:
             frameBuf[bitIndex++] = sampledBit;
@@ -458,8 +448,8 @@ void crcStateMachine() {
             break;
         case CRC_DELIMITER:
             if (sampledBit != '1') {
-                printf("CRC delimiter error: ");
-                printf("Must be a recessive bit.\n");
+                Serial.print("CRC delimiter error: ");
+                Serial.println("Must be a recessive bit.");
                 hasError = 1;
             } else {
                 frameBuf[bitIndex++] = sampledBit;
@@ -468,18 +458,18 @@ void crcStateMachine() {
             }
             break;
         default:
-            printf("CRC error: invalid sub-frame field.\n");
+            Serial.println("CRC error: invalid sub-frame field.");
             return;
     }
 }
 
 void ackStateMachine() {
-    printf("ACK\n");
+    Serial.println("ACK");
     switch (currentFrameSubField) {
         case ACK_SLOT:
             if (sampledBit == '1') { // None of the stations has acknowledged the message.
-                printf("Acknowledgment error: ");
-                printf("Failed to validade the message correctly.\n");
+                Serial.print("Acknowledgment error: ");
+                Serial.println("Failed to validade the message correctly.");
                 hasError = 1;
             } else {
                 frameBuf[bitIndex++] = sampledBit;
@@ -488,12 +478,12 @@ void ackStateMachine() {
             break;
         case ACK_DELIMITER:
             if (crcError) {
-                printf("CRC error: ");
-                printf("The calculated result is not the same as that received in the CRC sequence.\n");
+                Serial.print("CRC error: ");
+                Serial.println("The calculated result is not the same as that received in the CRC sequence.");
                 hasError = 1;
             } else if (sampledBit != '1') {
-                printf("Acknowledgment delimiter error: ");
-                printf("Must be a recessive bit.\n");
+                Serial.print("Acknowledgment delimiter error: ");
+                Serial.println("Must be a recessive bit.");
                 hasError = 1;
             } else {
                 bitCnt = 0;
@@ -502,13 +492,13 @@ void ackStateMachine() {
             }
             break;
         default:
-            printf("Ack error: invalid sub-frame field.\n");
+            Serial.println("Ack error: invalid sub-frame field.");
             return;
     }
 }
 
 void endOfFrameStateMachine() {
-    printf("End of frame\n");
+    Serial.println("End of frame");
     if (sampledBit == '1') {
         frameBuf[bitIndex++] = sampledBit;
         bitCnt++;
@@ -520,22 +510,22 @@ void endOfFrameStateMachine() {
             isTransmitter = 0;  // Disabling transmission.
         }
     } else {
-        printf("End of frame error: ");
-        printf("Expecting a flag sequence consisting of 7 recessive bits.\n");
+        Serial.print("End of frame error: ");
+        Serial.println("Expecting a flag sequence consisting of 7 recessive bits.");
         hasError = 1;
     }
 }
 
 void errorStateMachine() {
-    printf("Error frame\n");
+    Serial.println("Error frame");
     switch(currentFrameSubField) {
         case ERROR_FLAG:
             if (sampledBit == '0') {
                 bitCnt++;
             } else if (sampledBit == '1') {
                 if (bitCnt < 6) {
-                    printf("Error flag error: ");
-                    printf("Expecting at least 6 equal bits during error flag.\n");
+                    Serial.print("Error flag error: ");
+                    Serial.println("Expecting at least 6 equal bits during error flag.");
                     hasError = 1;
                 } else if (bitCnt >= 6 && bitCnt <= 12) {
                     bitCnt = 7;
@@ -543,8 +533,8 @@ void errorStateMachine() {
                 }
             }
             if (bitCnt > 12) {
-                printf("Error flag error: ");
-                printf("Expecting maximum of 12 equal bits during error flag.\n");
+                Serial.print("Error flag error: ");
+                Serial.println("Expecting maximum of 12 equal bits during error flag.");
                 hasError = 1;
             }
             break;
@@ -556,19 +546,19 @@ void errorStateMachine() {
                     currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
                 }
             } else {
-                printf("Error delimiter error: ");
-                printf("Expecting 8 recessive bits during error delimiter.\n");
+                Serial.print("Error delimiter error: ");
+                Serial.println("Expecting 8 recessive bits during error delimiter.");
                 hasError = 1;
             }
             break;
         default:
-            printf("Error frame error: invalid sub-frame field.\n");
+            Serial.println("Error frame error: invalid sub-frame field.");
             return;
     }
 }
 
 void overloadStateMachine() {
-    printf("Overload frame\n");
+    Serial.println("Overload frame");
     switch(currentFrameSubField) {
         case OVERLOAD_FLAG:
             if (sampledBit == '0') {
@@ -578,8 +568,8 @@ void overloadStateMachine() {
                     currentFrameSubField = OVERLOAD_DELIMITER;
                 }
             } else if (sampledBit == '1') {
-                printf("Overload flag error: ");
-                printf("Expecting 6 dominant bits during overload flag.\n");
+                Serial.print("Overload flag error: ");
+                Serial.println("Expecting 6 dominant bits during overload flag.");
                 hasError = 1;
             }
             break;
@@ -591,13 +581,13 @@ void overloadStateMachine() {
                     currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
                 }
             } else {
-                printf("Overload delimiter error: ");
-                printf("Expecting 8 recessive bits during overload delimiter.\n");
+                Serial.print("Overload delimiter error: ");
+                Serial.println("Expecting 8 recessive bits during overload delimiter.");
                 hasError = 1;
             }
             break;
         default:
-            printf("Overload frame error: invalid sub-frame field.\n");
+            Serial.println("Overload frame error: invalid sub-frame field.");
             return;
     }
 }
@@ -638,12 +628,12 @@ void decoderStateMachine() {
             overloadStateMachine();
             break;
         default:
-            printf("Decoder error: invalid frame field.\n");
+            Serial.println("Decoder error: invalid frame field.");
             break;
     }
     if (hasError) {
         printFrameInfo(receivedframe);
-        printf("Start receiving error flag...\n");
+        Serial.println("Start receiving error flag...");
         bitCnt = 0;
         hasError = 0;
         isTransmitter = 1;
@@ -734,12 +724,14 @@ void encoderStateMachine() {
             }
             break;
         default:
-            printf("Encoder error: invalid frame field %d.\n", currentFrameField);
+            Serial.print("Encoder error: invalid frame field ");
+            Serial.println(currentFrameField);
             break;
     }
 }
 
 void bitTimingStateMachine() {
+    plotValues();
     switch(currentSegment) {
         case SYNC_SEG:
             if(tqSegCnt == SYNC_SEG_LEN) {
@@ -776,6 +768,9 @@ void bitTimingStateMachine() {
             Serial.println("Unknown segment!");
             break;
     }
+    tqSegCnt++;
+    hardSyncBool = false;
+    resyncBool = false;
 }
 
 void restoreSegsDefaultLen() {
@@ -818,56 +813,62 @@ void resync() {
 
 void printFrameInfo(Frame frame) {
     int i;
-    printf("\n------- FRAME INFO -------\n");
-    printf("ID (11-bit): ");
+    Serial.println();
+    Serial.println("------- FRAME INFO -------");
+    Serial.print("ID (11-bit): ");
     for (i = 0; i < 11; i++) {
-        printf("%c", frame.idA[i]);
+        Serial.print(frame.idA[i]);
     }
-    printf("\n");
+    Serial.println();
 
-    printf("RTR: %c\n", frame.rtr);
+    Serial.print("RTR: ");
+    Serial.println(frame.rtr);
 
-    printf("IDE: %c\n", frame.ide);
+    Serial.print("IDE: ");
+    Serial.println(frame.ide);
 
     if (frame.ide == '1') {
-        printf("SRR: %c\n", frame.srr);
-        printf("ID (18-bit): ");
+        Serial.print("SRR: ");
+        Serial.println(frame.srr);
+        Serial.print("ID (18-bit): ");
         for (i = 0; i < 18; i++) {
-            printf("%c", frame.idB[i]);
+            Serial.print(frame.idB[i]);
         }
-        printf("\n");
-        printf("r1: %c\n", frame.r1);
+        Serial.println();
+        Serial.print("r1: ");
+        Serial.println(frame.r1);
     }
 
-    printf("r0: %c\n", frame.r0);
+    Serial.print("r0: ");
+    Serial.println(frame.r0);
 
-    printf("DLC: ");
+    Serial.print("DLC: ");
     for (i = 0; i < 4; i++) {
-        printf("%c", frame.dlc[i]);
+        Serial.print(frame.dlc[i]);
     }
-    printf("\n");
-
+    Serial.println();
 
     if (frame.rtr == '0') {
-        printf("Data: ");
+        Serial.print("Data: ");
         for (i = 0; i < 8 * dlc; i++) {
-            printf("%c", frame.data[i]);
+            Serial.print(frame.data[i]);
         }
-        printf("\n");
+        Serial.println();
     }
 
-    printf("CRC: ");
+    Serial.print("CRC: ");
     for (i = 0; i < 15; i++) {
-        printf("%c", frame.crc[i]);
+        Serial.print(frame.crc[i]);
     }
-    printf("\n");
+    Serial.println();
 
-    printf("Frame (destuffed): ");
+    Serial.print("Frame (destuffed): ");
     for (i = 0; i < bitIndex; i++) {
-        printf("%c", frameBuf[i]);
+        Serial.print(frameBuf[i]);
     }
 
-    printf("\n\n");
+    Serial.println();
+    Serial.println();
 }
 
 void plotValues() {
