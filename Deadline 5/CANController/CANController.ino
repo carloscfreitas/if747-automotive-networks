@@ -112,7 +112,7 @@ unsigned char prevFrameField;
 
 unsigned char frameBuf[MAX_FRAME_SIZE];
 unsigned char sampledBit;
-unsigned char writingBit;
+unsigned char writingBit = '1';
 unsigned char previousBit;
 unsigned char bitIndex = 0;
 unsigned char bitCnt   = 0;
@@ -141,18 +141,7 @@ typedef struct{
     unsigned char crc[15];
 } Frame;
 
-Frame frame = {
-    "1010111011",
-    '0',
-    '0',
-    '0',
-    "00000000000000000",
-    '0',
-    '0',
-    "0010",
-    "1010101010101010",
-    "011011011110011"
-};
+Frame frame;
 Frame receivedframe;
 
 int bitLevel;
@@ -184,34 +173,36 @@ void interruptServiceRoutine() {
     tqSegCnt++;
     
     // Check need to synchronize (hard/soft).
-    if (currentFrameField == START_OF_FRAME) {
-        hardSync();
-    } else if (previousBit == '1' && digitalRead(RX) == HIGH && !writingPoint) { // Falling edge out of SYNC_SEG.
-        resync();
-    } else {
+//    if (currentFrameField == START_OF_FRAME) {
+//        hardSync();
+//    } else if (previousBit == '1' && digitalRead(RX) == HIGH && !writingPoint) { // Falling edge out of SYNC_SEG.
+//        resync();
+//    } else {
         bitTimingStateMachine();
-    }
+//    }
     
     // If in sample point, sample bit and updade Decoder state machine.
     if (samplePoint) {
-        bitLevel = digitalRead(RX);
-        sampledBit = bitLevel == HIGH ? '0' : '1';
+//        bitLevel = digitalRead(RX);
+//        sampledBit = bitLevel == HIGH ? '0' : '1';
+        sampledBit = writingBit;
+        Serial.print("Sampled bit: ");
+        Serial.println(sampledBit - '0');
         decoderStateMachine();
     } else if (writingPoint) {
         // Write bit to bus if the unit is transmitting or if the frame is in ACK slot field.
         if (isTransmitter || (currentFrameField == ACK && currentFrameSubField == ACK_SLOT)) {
             encoderStateMachine();
-            bitLevel = writingBit == '0' ? HIGH : LOW;
-            digitalWrite(TX, bitLevel);
+//            bitLevel = writingBit == '0' ? HIGH : LOW;
+//            digitalWrite(TX, bitLevel);
+            Serial.print("Writing bit: ");
+            Serial.println(writingBit - '0');
         }
     }
 }
 
 void loop() {
-    Serial.println("Aqui!");
-    sendMessage = true;
-    while(!hasReceivedMessage);
-    hasReceivedMessage = false;
+  
 }
 
 void checkBitStuffing() {
@@ -271,6 +262,9 @@ void interframeSpaceStateMachine() {
     Serial.println(F("Interframe space"));
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
+            isTransmitter = 1;
+            currentFrameField = START_OF_FRAME;
+            break;
             if (sampledBit == '0') {
                 if (bitCnt == 2) {
                     /***
@@ -320,14 +314,12 @@ void interframeSpaceStateMachine() {
             }
             break;
         case INTERFRAME_SPACE_BUS_IDLE:
-            if (sendMessage) {
-                sendMessage = false;
-                isTransmitter = 1;
-                currentFrameField = START_OF_FRAME;
-            }
             if (sampledBit == '0') {
                 currentFrameField = START_OF_FRAME;
                 decoderStateMachine();
+            } else {
+                isTransmitter = 1;
+                currentFrameField = START_OF_FRAME;
             }
             break;
         default:
@@ -699,10 +691,40 @@ void decoderStateMachine() {
         currentFrameSubField = ERROR_FLAG;
     }
 }
+unsigned char idA[] = "11001110010";
+unsigned char rtr = '0';
+unsigned char srr = '0';
+unsigned char ide = '0';
+unsigned char idB[] = "000000000000000000";
+unsigned char r1 = '0';
+unsigned char r0 = '0';
+unsigned char dlc2[] = "0010";
+unsigned char data[] = "1010101010101010";
+unsigned char crc2[] = "011011011110011";
 
 void encoderStateMachine() {
     switch (currentFrameField) {
         case START_OF_FRAME:
+            for(int i = 0; i < 11; i++) {
+                frame.idA[i] = idA[i];
+            }
+            frame.rtr = rtr;
+            frame.srr = srr;
+            frame.ide = ide;
+            for(int i = 0; i < 18; i++) {
+                frame.idB[i] = idB[i];
+            }
+            frame.r1 = r1;
+            frame.r0 = r0;
+            for(int i = 0; i < 4; i++) {
+                frame.dlc[i] = dlc2[i];
+            }
+            for(int i = 0; i < 64; i++) {
+                frame.data[i] = data[i];
+            }
+            for(int i = 0; i < 15; i++) {
+                frame.crc[i] = crc2[i];
+            }
             printFrameInfo(frame);
             writingBit = '0';
             break;
@@ -790,7 +812,7 @@ void encoderStateMachine() {
 }
 
 void bitTimingStateMachine() {
-    plotValues();
+//    plotValues();
     switch(currentSegment) {
         case SYNC_SEG:
             if(tqSegCnt == SYNC_SEG_LEN) {
@@ -880,54 +902,54 @@ void printFrameInfo(Frame frame) {
     Serial.println(F("------- FRAME INFO -------"));
     Serial.print(F("ID (11-bit): "));
     for (i = 0; i < 11; i++) {
-        Serial.print(frame.idA[i]);
+        Serial.print(frame.idA[i] - '0');
     }
     Serial.println();
 
     Serial.print(F("RTR: "));
-    Serial.println(frame.rtr);
+    Serial.println(frame.rtr - '0');
 
     Serial.print(F("IDE: "));
-    Serial.println(frame.ide);
+    Serial.println(frame.ide - '0');
 
     if (frame.ide == '1') {
         Serial.print(F("SRR: "));
-        Serial.println(frame.srr);
+        Serial.println(frame.srr - '0');
         Serial.print(F("ID (18-bit): "));
         for (i = 0; i < 18; i++) {
-            Serial.print(frame.idB[i]);
+            Serial.print(frame.idB[i] - '0');
         }
         Serial.println();
         Serial.print(F("r1: "));
-        Serial.println(frame.r1);
+        Serial.println(frame.r1 - '0');
     }
 
     Serial.print(F("r0: "));
-    Serial.println(frame.r0);
+    Serial.println(frame.r0 - '0');
 
     Serial.print(F("DLC: "));
     for (i = 0; i < 4; i++) {
-        Serial.print(frame.dlc[i]);
+        Serial.print(frame.dlc[i] - '0');
     }
     Serial.println();
 
     if (frame.rtr == '0') {
         Serial.print(F("Data: "));
         for (i = 0; i < 8 * dlc; i++) {
-            Serial.print(frame.data[i]);
+            Serial.print(frame.data[i] - '0');
         }
         Serial.println();
     }
 
     Serial.print(F("CRC: "));
     for (i = 0; i < 15; i++) {
-        Serial.print(frame.crc[i]);
+        Serial.print(frame.crc[i] - '0');
     }
     Serial.println();
 
     Serial.print(F("Frame (destuffed): "));
     for (i = 0; i < bitIndex; i++) {
-        Serial.print(frameBuf[i]);
+        Serial.print(frameBuf[i] - '0');
     }
 
     Serial.println();
