@@ -158,16 +158,18 @@ volatile unsigned char phaseSeg1Len   = PHASE_SEG1_LEN;
 volatile unsigned char phaseSeg2Len   = PHASE_SEG2_LEN;
 
 void setup() {
-    Serial.begin(2400);
+    Serial.begin(115200);
     pinMode(TX, OUTPUT);
     pinMode(RX, INPUT);
     
     // Configuração do TIMER1 
     Timer1.initialize(TQ);         // initialize timer1, and set a TQ second period
-    Timer1.attachInterrupt(interruptServiceRoutine);  // attaches interruptServiceRoutine() as a timer overflow interrupt
+    Timer1.attachInterrupt(_ISR);  // attaches interruptServiceRoutine() as a timer overflow interrupt
+
+    setupFrameToEncode();    // Initialize the frame to be sent by the encoder.
 }
 
-void interruptServiceRoutine() {
+void _ISR() {
     hardSyncBool = false;
     resyncBool = false;
     tqSegCnt++;
@@ -178,25 +180,33 @@ void interruptServiceRoutine() {
 //    } else if (previousBit == '1' && digitalRead(RX) == HIGH && !writingPoint) { // Falling edge out of SYNC_SEG.
 //        resync();
 //    } else {
-        bitTimingStateMachine();
+      bitTimingStateMachine();
 //    }
     
     // If in sample point, sample bit and updade Decoder state machine.
     if (samplePoint) {
-//        bitLevel = digitalRead(RX);
-//        sampledBit = bitLevel == HIGH ? '0' : '1';
-        sampledBit = writingBit;
-        Serial.print("Sampled bit: ");
-        Serial.println(sampledBit - '0');
+        bitLevel = digitalRead(RX);
+        sampledBit = bitLevel == HIGH ? '0' : '1';
+        // Check if bit sampled is different from the bit written by the encoder.
+        if (isTransmitter && (sampledBit != writingBit)) {
+            // Check if it's in arbitration process. Otherwise, it is a bit error.
+            if (currentFrameField == ARBITRATION && (currentFrameSubField == ARBITRATION_IDENTIFIER_11_BIT
+                || currentFrameSubField == ARBITRATION_IDENTIFIER_18_BIT)) {
+                Serial.print(F("Lost arbitration. Aborting transmission."));
+                isTransmitter = 0;
+            } else {
+                Serial.print(F("Bit error: "));
+                Serial.println(F("Sampled bit level is different from the bit level written by the encoder."));
+                hasError = 1;
+            }
+        }
         decoderStateMachine();
     } else if (writingPoint) {
         // Write bit to bus if the unit is transmitting or if the frame is in ACK slot field.
         if (isTransmitter || (currentFrameField == ACK && currentFrameSubField == ACK_SLOT)) {
             encoderStateMachine();
-//            bitLevel = writingBit == '0' ? HIGH : LOW;
-//            digitalWrite(TX, bitLevel);
-            Serial.print("Writing bit: ");
-            Serial.println(writingBit - '0');
+            bitLevel = writingBit == '0' ? HIGH : LOW;
+            digitalWrite(TX, bitLevel);
         }
     }
 }
@@ -224,7 +234,7 @@ void bitStuffingStateMachine() {
         hasError = 1;
     } else {
         Serial.print(F("Stuffed bit: "));
-        Serial.println(sampledBit);
+        Serial.println(sampledBit - '0');
         samePolarityBitCnt = 1;
         previousBit = sampledBit;
         currentFrameField = prevFrameField;
@@ -253,6 +263,10 @@ void computeCrcSequence() {
 
 int validateCrcSequence() {
     int j;
+    for (j = 0; j < 15; j++) {
+        Serial.print(crc[j] - '0');
+    }
+    Serial.println();
     for (j = 0; j < 15 && !crcError; j++) {
         crcError = crc[j] != receivedframe.crc[j];
     }
@@ -262,9 +276,6 @@ void interframeSpaceStateMachine() {
     Serial.println(F("Interframe space"));
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
-            isTransmitter = 1;
-            currentFrameField = START_OF_FRAME;
-            break;
             if (sampledBit == '0') {
                 if (bitCnt == 2) {
                     /***
@@ -298,14 +309,8 @@ void interframeSpaceStateMachine() {
                 bitCnt++;
                 if (bitCnt == 3) {
                     bitCnt = 0;
-                    if (sendMessage) {
-                        sendMessage = false;
-                        isTransmitter = 1;
-                        currentFrameField = START_OF_FRAME;
-                    } else {
-                        currentFrameField = INTERFRAME_SPACE;
-                        currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
-                    }
+                    currentFrameField = INTERFRAME_SPACE;
+                    currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
                 }
             } else {
                 Serial.print(F("Interframe space error: "));
@@ -336,8 +341,8 @@ void startOfFrameStateMachine() {
     bitIndex = 0;
     crcError = 0;
     hasError = 0;
-    receivedframe.ide ?: 0;  // Assuming Standard format when in Receiver mode.
-    bitFieldIndex     = 0;
+    receivedframe.ide  = '0';  // Assuming Standard format when in Receiver mode.
+    bitFieldIndex      = 0;
     overloadFrameCnt   = 0;
     samePolarityBitCnt = 1;
     previousBit = sampledBit;
@@ -361,7 +366,7 @@ void arbitrationStateMachine() {
             if (bitFieldIndex == 11) {
                 bitFieldIndex = 0;
                 if (isTransmitter) {
-                    currentFrameSubField = (receivedframe.ide == '0') ? ARBITRATION_RTR : ARBITRATION_SRR;
+                    currentFrameSubField = (frame.ide == '0') ? ARBITRATION_RTR : ARBITRATION_SRR;
                 } else {
                     currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
                 }
@@ -371,6 +376,10 @@ void arbitrationStateMachine() {
             receivedframe.rtr = sampledBit;
             frameBuf[bitIndex++] = sampledBit;
             currentFrameField = CONTROL;
+            if (isTransmitter) {
+                currentFrameSubField = (frame.ide == '1') ? CONTROL_r1 : CONTROL_IDE;
+                break;
+            }
             if (receivedframe.ide == '1') currentFrameSubField = CONTROL_r1;  // Extended format.
             else currentFrameSubField = CONTROL_IDE;    // Standard format.
             break;
@@ -385,6 +394,7 @@ void arbitrationStateMachine() {
             }
             break;
         case ARBITRATION_IDE: // Empty transition to 18 bit identifier.
+            if (isTransmitter) receivedframe.ide = sampledBit;
             bitFieldIndex = 0;
             currentFrameSubField = ARBITRATION_IDENTIFIER_18_BIT;
             break;
@@ -557,6 +567,8 @@ void endOfFrameStateMachine() {
             currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
             isTransmitter = 0;  // Disabling transmission.
             hasReceivedMessage = convertArrayToNum(receivedframe.idA, 11) == RECEIVE_PID;
+            Serial.print(F("hasReceivedMessage: "));
+            Serial.println(hasReceivedMessage);
         }
     } else {
         Serial.print(F("End of frame error: "));
@@ -642,43 +654,45 @@ void overloadStateMachine() {
 }
 
 void decoderStateMachine() {
-    switch(currentFrameField) {
-        case INTERFRAME_SPACE:
-            interframeSpaceStateMachine();
-            break;
-        case START_OF_FRAME:
-            startOfFrameStateMachine();
-            break;
-        case ARBITRATION:
-            arbitrationStateMachine();
-            break;
-        case CONTROL:
-            controlStateMachine();
-            break;
-        case DATA:
-            dataStateMachine();
-            break;
-        case CRC:
-            crcStateMachine();
-            break;
-        case ACK:
-            ackStateMachine();
-            break;
-        case END_OF_FRAME:
-            endOfFrameStateMachine();
-            break;
-        case BIT_STUFFING:
-            bitStuffingStateMachine();
-            break;
-        case ERROR:
-            errorStateMachine();
-            break;
-        case OVERLOAD:
-            overloadStateMachine();
-            break;
-        default:
-            Serial.println(F("Decoder error: invalid frame field."));
-            break;
+    if (!hasError) { // Execute only if there is no bit error.
+        switch(currentFrameField) {
+            case INTERFRAME_SPACE:
+                interframeSpaceStateMachine();
+                break;
+            case START_OF_FRAME:
+                startOfFrameStateMachine();
+                break;
+            case ARBITRATION:
+                arbitrationStateMachine();
+                break;
+            case CONTROL:
+                controlStateMachine();
+                break;
+            case DATA:
+                dataStateMachine();
+                break;
+            case CRC:
+                crcStateMachine();
+                break;
+            case ACK:
+                ackStateMachine();
+                break;
+            case END_OF_FRAME:
+                endOfFrameStateMachine();
+                break;
+            case BIT_STUFFING:
+                bitStuffingStateMachine();
+                break;
+            case ERROR:
+                errorStateMachine();
+                break;
+            case OVERLOAD:
+                overloadStateMachine();
+                break;
+            default:
+                Serial.println(F("Decoder error: invalid frame field."));
+                break;
+        }
     }
     if (hasError) {
         printFrameInfo(receivedframe);
@@ -691,40 +705,10 @@ void decoderStateMachine() {
         currentFrameSubField = ERROR_FLAG;
     }
 }
-unsigned char idA[] = "11001110010";
-unsigned char rtr = '0';
-unsigned char srr = '0';
-unsigned char ide = '0';
-unsigned char idB[] = "000000000000000000";
-unsigned char r1 = '0';
-unsigned char r0 = '0';
-unsigned char dlc2[] = "0010";
-unsigned char data[] = "1010101010101010";
-unsigned char crc2[] = "011011011110011";
 
 void encoderStateMachine() {
     switch (currentFrameField) {
         case START_OF_FRAME:
-            for(int i = 0; i < 11; i++) {
-                frame.idA[i] = idA[i];
-            }
-            frame.rtr = rtr;
-            frame.srr = srr;
-            frame.ide = ide;
-            for(int i = 0; i < 18; i++) {
-                frame.idB[i] = idB[i];
-            }
-            frame.r1 = r1;
-            frame.r0 = r0;
-            for(int i = 0; i < 4; i++) {
-                frame.dlc[i] = dlc2[i];
-            }
-            for(int i = 0; i < 64; i++) {
-                frame.data[i] = data[i];
-            }
-            for(int i = 0; i < 15; i++) {
-                frame.crc[i] = crc2[i];
-            }
             printFrameInfo(frame);
             writingBit = '0';
             break;
@@ -885,6 +869,41 @@ void resync() {
         default:
             Serial.println(F("Unknown segment!"));
             break;
+    }
+}
+
+void setupFrameToEncode() {
+    int i;
+    unsigned char idA[] = "11001110010";
+    unsigned char rtr = '0';
+    unsigned char srr = '1';
+    unsigned char ide = '0';
+    unsigned char idB[] = "110000000001111010";
+    unsigned char r1 = '0';
+    unsigned char r0 = '0';
+    unsigned char dlc2[] = "1000";
+    unsigned char data[] = "1010101010101010101010101010101010101010101010101010101010101010";
+    unsigned char crc2[] = "000000001010001";
+    
+    for(i = 0; i < 11; i++) {
+        frame.idA[i] = idA[i];
+    }
+    frame.rtr = rtr;
+    frame.srr = srr;
+    frame.ide = ide;
+    for(i = 0; i < 18; i++) {
+        frame.idB[i] = idB[i];
+    }
+    frame.r1 = r1;
+    frame.r0 = r0;
+    for(i = 0; i < 4; i++) {
+        frame.dlc[i] = dlc2[i];
+    }
+    for(i = 0; i < 64; i++) {
+        frame.data[i] = data[i];
+    }
+    for(i = 0; i < 15; i++) {
+        frame.crc[i] = crc2[i];
     }
 }
 
