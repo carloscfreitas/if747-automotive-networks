@@ -103,8 +103,8 @@
 #define RECEIVE_PID 0x0449
 #define SEND_PID    0x0672
 
-#define TX 6
-#define RX 7
+#define TX 4
+#define RX 3
 
 unsigned char currentFrameField    = INTERFRAME_SPACE;
 unsigned char currentFrameSubField = INTERFRAME_SPACE_BUS_IDLE;
@@ -151,6 +151,7 @@ bool writingPoint = false;
 bool hasReceivedMessage     = false;
 volatile bool hardSyncBool  = false;
 volatile bool resyncBool    = false;
+volatile bool advanceStateMachine = false;
 volatile unsigned char currentSegment = PROP_SEG;
 volatile unsigned char tqSegCnt       = 0;
 volatile unsigned char phaseError     = 0;
@@ -164,55 +165,70 @@ void setup() {
     
     // Configuração do TIMER1 
     Timer1.initialize(TQ);         // initialize timer1, and set a TQ second period
-    Timer1.attachInterrupt(_ISR);  // attaches interruptServiceRoutine() as a timer overflow interrupt
+    Timer1.attachInterrupt(tick);  // attaches tick() as a timer overflow interrupt
+    attachInterrupt(digitalPinToInterrupt(RX), sync, RISING);
 
     setupFrameToEncode();    // Initialize the frame to be sent by the encoder.
 }
 
-void _ISR() {
-    hardSyncBool = false;
-    resyncBool = false;
-    tqSegCnt++;
-    
-    // Check need to synchronize (hard/soft).
-//    if (currentFrameField == START_OF_FRAME) {
-//        hardSync();
-//    } else if (previousBit == '1' && digitalRead(RX) == HIGH && !writingPoint) { // Falling edge out of SYNC_SEG.
-//        resync();
-//    } else {
-      bitTimingStateMachine();
-//    }
-    
-    // If in sample point, sample bit and updade Decoder state machine.
-    if (samplePoint) {
-        bitLevel = digitalRead(RX);
-        sampledBit = bitLevel == HIGH ? '0' : '1';
-        // Check if bit sampled is different from the bit written by the encoder.
-        if (isTransmitter && (sampledBit != writingBit)) {
-            // Check if it's in arbitration process. Otherwise, it is a bit error.
-            if (currentFrameField == ARBITRATION && (currentFrameSubField == ARBITRATION_IDENTIFIER_11_BIT
-                || currentFrameSubField == ARBITRATION_IDENTIFIER_18_BIT)) {
-                Serial.print(F("Lost arbitration. Aborting transmission."));
-                isTransmitter = 0;
-            } else {
-                Serial.print(F("Bit error: "));
-                Serial.println(F("Sampled bit level is different from the bit level written by the encoder."));
-                hasError = 1;
-            }
-        }
-        decoderStateMachine();
-    } else if (writingPoint) {
-        // Write bit to bus if the unit is transmitting or if the frame is in ACK slot field.
-        if (isTransmitter || (currentFrameField == ACK && currentFrameSubField == ACK_SLOT)) {
-            encoderStateMachine();
-            bitLevel = writingBit == '0' ? HIGH : LOW;
-            digitalWrite(TX, bitLevel);
-        }
+void sync() {
+    if (currentFrameField == START_OF_FRAME) { 
+        hardSync();
+    } else {
+        resync();
     }
 }
 
+void tick() {
+    advanceStateMachine = true;
+}
+
 void loop() {
-  
+    if (advanceStateMachine) {
+        advanceStateMachine = false;
+        hardSyncBool = false;
+        resyncBool = false;
+        tqSegCnt++;
+        bitTimingStateMachine();
+        // If in sample point, sample bit and updade Decoder state machine.
+        if (samplePoint) {
+            bitLevel = digitalRead(RX);
+            sampledBit = bitLevel == HIGH ? '0' : '1';
+            // Check if bit sampled is different from the bit written by the encoder.
+            if (isTransmitter && (sampledBit != writingBit)) {
+                // Check if it's in arbitration process or ACK. Otherwise, it is a bit error.
+                if (currentFrameField == ARBITRATION && (currentFrameSubField == ARBITRATION_IDENTIFIER_11_BIT
+                    || currentFrameSubField == ARBITRATION_IDENTIFIER_18_BIT)) {
+                    if (writingBit = '0') {
+                        Serial.print(F("Won arbitration. Continuing transmission."));
+                    } else if(writingBit = '1') {
+                        Serial.print(F("Lost arbitration. Aborting transmission."));
+                        isTransmitter = 0;
+                    }
+                } else if (currentFrameField == ACK && currentFrameSubField == ACK_SLOT) {
+                    Serial.println(F("Acknowledged!"));
+                } else {
+                    Serial.print(F("Bit error: "));
+                    Serial.println(F("Sampled bit level is different from the bit level written by the encoder."));
+                    Serial.print(F("Written bit: "));
+                    Serial.print(writingBit - '0');
+                    Serial.print(" ");
+                    Serial.print(F("Sampled bit: "));
+                    Serial.println(sampledBit - '0');
+                    hasError = 1;
+                }
+            }
+            decoderStateMachine();
+        } else if (writingPoint) {
+            // Write bit to bus if the unit is transmitting or if the frame is in ACK slot field.
+            if (isTransmitter || (currentFrameField == ACK && currentFrameSubField == ACK_SLOT)) {
+                encoderStateMachine();
+                bitLevel = writingBit == '0' ? HIGH : LOW;
+                digitalWrite(TX, bitLevel);
+            }
+        }
+//        plotValues();
+    }
 }
 
 void checkBitStuffing() {
@@ -796,7 +812,6 @@ void encoderStateMachine() {
 }
 
 void bitTimingStateMachine() {
-//    plotValues();
     switch(currentSegment) {
         case SYNC_SEG:
             if(tqSegCnt == SYNC_SEG_LEN) {
@@ -808,7 +823,6 @@ void bitTimingStateMachine() {
         case PROP_SEG:
             if(tqSegCnt == PROP_SEG_LEN) {
               tqSegCnt = 0;
-              writingPoint = false;
               currentSegment = PHASE_SEG1;
             }
             break;
@@ -842,26 +856,28 @@ void restoreSegsDefaultLen() {
 
 void hardSync() {
     hardSyncBool = true;
-    writingPoint = true;
+    writingPoint = false;
     currentSegment = PROP_SEG;
     tqSegCnt = 0;
 }
 
 void resync() {
-    resyncBool = true;
     switch(currentSegment){
         case SYNC_SEG:
             break;
         case PROP_SEG:
+            resyncBool = true;
             // Lengthen PHASE_SEG1 to compensate phase error (max. SJW).
             phaseError = min(tqSegCnt + SYNC_SEG_LEN, PROP_SEG_LEN);
             phaseSeg1Len = PHASE_SEG1_LEN + ((phaseError <= SJW) ? phaseError : SJW);
         case PHASE_SEG1:
+            resyncBool = true;
             // Lengthen segment to compensate phase error (max. SJW).
             phaseError = min((tqSegCnt + PROP_SEG_LEN + SYNC_SEG_LEN), PHASE_SEG1_LEN);
             phaseSeg1Len = PHASE_SEG1_LEN + ((phaseError <= SJW) ? phaseError : SJW);
             break;
         case PHASE_SEG2:
+            resyncBool = true;
             // Shorten segment to compensate phase error (max. SJW).
             phaseError = min((PHASE_SEG2_LEN - tqSegCnt), PHASE_SEG2_LEN);
             phaseSeg2Len = PHASE_SEG2_LEN - ((phaseError <= SJW) ? phaseError : SJW);
@@ -871,6 +887,7 @@ void resync() {
             break;
     }
 }
+
 
 void setupFrameToEncode() {
     int i;
