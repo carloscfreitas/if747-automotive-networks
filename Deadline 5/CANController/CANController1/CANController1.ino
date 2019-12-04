@@ -16,8 +16,8 @@
 #define PHASE_SEG2_LEN 7
 #define BIT_LEN (SYNC_SEG_LEN + PROP_SEG_LEN + PHASE_SEG1_LEN + PHASE_SEG2_LEN)
 
-#define SJW 1 // Synchronization Jump Width (dafault: 1 TQ).
-#define BAUD_RATE 10 // Baud rate (default: 10 bps).
+#define SJW 5 // Synchronization Jump Width (dafault: 1 TQ).
+#define BAUD_RATE 1 // Baud rate (default: 10 bps).
 
 // Defining time quantum length (microseconds).
 // For a 10bps baud rate and 16 TQ bit length, time quantum must be 6250 microseconds.
@@ -159,37 +159,35 @@ volatile unsigned char phaseSeg1Len   = PHASE_SEG1_LEN;
 volatile unsigned char phaseSeg2Len   = PHASE_SEG2_LEN;
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(4800);
     pinMode(TX, OUTPUT);
     pinMode(RX, INPUT);
     
     // Configuração do TIMER1 
     Timer1.initialize(TQ);         // initialize timer1, and set a TQ second period
-    Timer1.attachInterrupt(tick);  // attaches tick() as a timer overflow interrupt
-    attachInterrupt(digitalPinToInterrupt(RX), sync, RISING);
+    Timer1.attachInterrupt(incrementTq);  // attaches incrementTq() as a timer overflow interrupt
+    attachInterrupt(digitalPinToInterrupt(RX), flagSync, RISING);
 
     setupFrameToEncode();    // Initialize the frame to be sent by the encoder.
 }
 
-void sync() {
+void flagSync() {
     if (currentFrameField == START_OF_FRAME) { 
-        hardSync();
+        hardSyncBool = true;
     } else {
-        resync();
+        resyncBool = true;
     }
 }
 
-void tick() {
+void incrementTq() {
+    tqSegCnt++;
+    bitTimingStateMachine();
     advanceStateMachine = true;
 }
 
 void loop() {
     if (advanceStateMachine) {
         advanceStateMachine = false;
-        hardSyncBool = false;
-        resyncBool = false;
-        tqSegCnt++;
-        bitTimingStateMachine();
         // If in sample point, sample bit and updade Decoder state machine.
         if (samplePoint) {
             bitLevel = digitalRead(RX);
@@ -227,7 +225,7 @@ void loop() {
                 digitalWrite(TX, bitLevel);
             }
         }
-//        plotValues();
+        plotValues();
     }
 }
 
@@ -235,8 +233,8 @@ void checkBitStuffing() {
     sampledBit == previousBit ? samePolarityBitCnt++ : (samePolarityBitCnt = 1);
     previousBit = sampledBit;
     if (samePolarityBitCnt == 5) {
-        Serial.print(F("Destuffing next bit at index "));
-        Serial.println(bitIndex);
+//        Serial.print(F("Destuffing next bit at index "));
+//        Serial.println(bitIndex);
         samePolarityBitCnt = 1;
         prevFrameField = currentFrameField;
         currentFrameField = BIT_STUFFING;
@@ -249,8 +247,8 @@ void bitStuffingStateMachine() {
         Serial.println(bitIndex);
         hasError = 1;
     } else {
-        Serial.print(F("Stuffed bit: "));
-        Serial.println(sampledBit - '0');
+//        Serial.print(F("Stuffed bit: "));
+//        Serial.println(sampledBit - '0');
         samePolarityBitCnt = 1;
         previousBit = sampledBit;
         currentFrameField = prevFrameField;
@@ -279,17 +277,17 @@ void computeCrcSequence() {
 
 int validateCrcSequence() {
     int j;
-    for (j = 0; j < 15; j++) {
-        Serial.print(crc[j] - '0');
-    }
-    Serial.println();
+//    for (j = 0; j < 15; j++) {
+//        Serial.print(crc[j] - '0');
+//    }
+//    Serial.println();
     for (j = 0; j < 15 && !crcError; j++) {
         crcError = crc[j] != receivedframe.crc[j];
     }
 }
 
 void interframeSpaceStateMachine() {
-    Serial.println(F("Interframe space"));
+//    Serial.println(F("Interframe space"));
     switch(currentFrameSubField) {
         case INTERFRAME_SPACE_INTERMISSION:
             if (sampledBit == '0') {
@@ -350,7 +348,7 @@ void interframeSpaceStateMachine() {
 };
 
 void startOfFrameStateMachine() {
-    Serial.println(F("Start of Frame"));
+//    Serial.println(F("Start of Frame"));
     int j;
     dlc      = 0;
     bitCnt   = 0;
@@ -373,7 +371,7 @@ void startOfFrameStateMachine() {
 };
 
 void arbitrationStateMachine() {
-    Serial.println(F("Arbitration"));
+//    Serial.println(F("Arbitration"));
     int skipState = 0;
     switch (currentFrameSubField) {
         case ARBITRATION_IDENTIFIER_11_BIT:
@@ -420,7 +418,7 @@ void arbitrationStateMachine() {
             if (bitFieldIndex == 18) currentFrameSubField = ARBITRATION_RTR; // Assuming Standard format.
             break;
         default:
-            Serial.println(F("Arbitration error: invalid sub-frame field."));
+//            Serial.println(F("Arbitration error: invalid sub-frame field."));
             return;
     }
     // Compute CRC sequence and check bit stuffing.
@@ -431,7 +429,7 @@ void arbitrationStateMachine() {
 }
 
 void controlStateMachine() {
-    Serial.println(F("Control"));
+//    Serial.println(F("Control"));
     int skipState = 0;
     switch (currentFrameSubField) {
         case CONTROL_IDE:
@@ -465,7 +463,7 @@ void controlStateMachine() {
             dlc += ((sampledBit - '0') << bitCnt);
             if (bitCnt == 0) {
                 dlc = min(dlc, 8); // Maximum number of data bytes: 8.
-                Serial.println(dlc);
+//                Serial.println(dlc);
                 bitFieldIndex = 0;
                 if (receivedframe.rtr == '0' && dlc != 0) currentFrameField = DATA; // Data frame.
                 else {
@@ -488,7 +486,7 @@ void controlStateMachine() {
 }
 
 void dataStateMachine() {
-    Serial.println(F("Data"));
+//    Serial.println(F("Data"));
     frameBuf[bitIndex++] = sampledBit;
     receivedframe.data[bitFieldIndex++] = sampledBit;
     bitCnt++;
@@ -506,7 +504,7 @@ void dataStateMachine() {
 }
 
 void crcStateMachine() {
-    Serial.println(F("CRC"));
+//    Serial.println(F("CRC"));
     switch (currentFrameSubField) {
         case CRC_SEQUENCE:
             frameBuf[bitIndex++] = sampledBit;
@@ -538,7 +536,7 @@ void crcStateMachine() {
 }
 
 void ackStateMachine() {
-    Serial.println(F("ACK"));
+//    Serial.println(F("ACK"));
     switch (currentFrameSubField) {
         case ACK_SLOT:
             if (sampledBit == '1') { // None of the stations has acknowledged the message.
@@ -572,19 +570,19 @@ void ackStateMachine() {
 }
 
 void endOfFrameStateMachine() {
-    Serial.println(F("End of frame"));
+//    Serial.println(F("End of frame"));
     if (sampledBit == '1') {
         frameBuf[bitIndex++] = sampledBit;
         bitCnt++;
         if (bitCnt == 7) {
             bitCnt = 0;
-            printFrameInfo(receivedframe);
+//            printFrameInfo(receivedframe);
             currentFrameField = INTERFRAME_SPACE;
             currentFrameSubField = INTERFRAME_SPACE_INTERMISSION;
             isTransmitter = 0;  // Disabling transmission.
             hasReceivedMessage = convertArrayToNum(receivedframe.idA, 11) == RECEIVE_PID;
-            Serial.print(F("hasReceivedMessage: "));
-            Serial.println(hasReceivedMessage);
+//            Serial.print(F("hasReceivedMessage: "));
+//            Serial.println(hasReceivedMessage);
         }
     } else {
         Serial.print(F("End of frame error: "));
@@ -594,7 +592,7 @@ void endOfFrameStateMachine() {
 }
 
 void errorStateMachine() {
-    Serial.println(F("Error frame"));
+//    Serial.println(F("Error frame"));
     switch(currentFrameSubField) {
         case ERROR_FLAG:
             if (sampledBit == '0') {
@@ -635,7 +633,7 @@ void errorStateMachine() {
 }
 
 void overloadStateMachine() {
-    Serial.println(F("Overload frame"));
+//    Serial.println(F("Overload frame"));
     switch(currentFrameSubField) {
         case OVERLOAD_FLAG:
             if (sampledBit == '0') {
@@ -711,7 +709,7 @@ void decoderStateMachine() {
         }
     }
     if (hasError) {
-        printFrameInfo(receivedframe);
+//        printFrameInfo(receivedframe);
         Serial.println(F("Start receiving error flag..."));
         bitCnt = 0;
         hasError = 0;
@@ -725,7 +723,7 @@ void decoderStateMachine() {
 void encoderStateMachine() {
     switch (currentFrameField) {
         case START_OF_FRAME:
-            printFrameInfo(frame);
+//            printFrameInfo(frame);
             writingBit = '0';
             break;
         case ARBITRATION:
@@ -812,6 +810,13 @@ void encoderStateMachine() {
 }
 
 void bitTimingStateMachine() {
+    if (hardSyncBool) {
+        writingPoint = false;
+        currentSegment = PROP_SEG;
+        tqSegCnt = 0;
+    } else if (resyncBool) {
+        resync();
+    }
     switch(currentSegment) {
         case SYNC_SEG:
             if(tqSegCnt == SYNC_SEG_LEN) {
@@ -847,6 +852,8 @@ void bitTimingStateMachine() {
             Serial.println(F("Unknown segment!"));
             break;
     }
+    hardSyncBool = false;
+    resyncBool = false;
 }
 
 void restoreSegsDefaultLen() {
@@ -873,7 +880,7 @@ void resync() {
         case PHASE_SEG1:
             resyncBool = true;
             // Lengthen segment to compensate phase error (max. SJW).
-            phaseError = min((tqSegCnt + PROP_SEG_LEN + SYNC_SEG_LEN), PHASE_SEG1_LEN);
+            phaseError = tqSegCnt + PROP_SEG_LEN + SYNC_SEG_LEN;
             phaseSeg1Len = PHASE_SEG1_LEN + ((phaseError <= SJW) ? phaseError : SJW);
             break;
         case PHASE_SEG2:
